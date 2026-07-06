@@ -2,31 +2,27 @@ package main
 
 import (
 	"fmt"
-	"toy-blockchain/block"
+	"toy-blockchain/chain"
 	"toy-blockchain/ledger"
 )
 
 func main() {
-	fmt.Println("=== Initializing Toy Blockchain Simulator ===")
+	fmt.Println("==================================================")
+	fmt.Println("        DAY 2: MINING & DIFFICULTY TUNING         ")
+	fmt.Println("==================================================")
 
-	// 1. Generate the deterministic Genesis Block (FR-2)
-	genesis := block.NewGenesisBlock()
-	fmt.Printf("Genesis Block Created!\n")
-	fmt.Printf("  Index:     %d\n", genesis.Index)
-	fmt.Printf("  Timestamp: %d\n", genesis.Timestamp)
-	fmt.Printf("  Prev Hash: %s\n", genesis.PrevHash)
-	fmt.Printf("  Block Hash:%s\n\n", genesis.Hash)
+	// We will loop through difficulty levels 1 to 5 to see how the effort scales
+	for diff := 1; diff <= 5; diff++ {
+		fmt.Printf("--- Initializing Chain Test with Difficulty: %d ---\n", diff)
+		bc := chain.NewBlockchain(diff)
 
-	// 2. Simulate creating a new block with a transaction batch (FR-1, FR-4)
-	fmt.Println("=== Creating Block 1 ===")
-	txs := []ledger.Transaction{
-		ledger.NewTransaction("faucet", "Amindya", 100.0),
-		ledger.NewTransaction("Amindya", "Bob", 30.0),
+		// Queue up an initial transaction from the faucet
+		_ = bc.AddTransaction(ledger.NewTransaction("faucet", "Amindya", 250.0))
+
+		// Mine the block (FR-5) -> this will print out our nonces and elapsed time!
+		_, _ = bc.MinePendingBlock()
 	}
 
-	block1 := block.NewBlock(1, txs, genesis.Hash)
-	fmt.Printf("Block 1 Struct Initialized!\n")
-	fmt.Printf("  Index:     %d\n", block1.Index)
-	fmt.Printf("  Prev Hash: %s\n", block1.PrevHash)
-	fmt.Printf("  Block Hash:%s\n", block1.Hash)
+	fmt.Println("==================================================")
+	fmt.Println("Tuning Complete! Choose a sweet spot for Day 3.")
 }

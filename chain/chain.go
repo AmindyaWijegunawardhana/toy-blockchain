@@ -1,8 +1,11 @@
 package chain
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io/ioutil"
+	"os"
 	"strings"
 	"sync"
 	"toy-blockchain/block"
@@ -115,4 +118,40 @@ func (bc *Blockchain) ValidateChain() (bool, int, error) {
 	}
 
 	return true, 0, nil
+}
+
+// SaveToFile serializes the blockchain and writes it out to disk.
+func (bc *Blockchain) SaveToFile(filename string) error {
+	bc.mu.RLock()
+	defer bc.mu.RUnlock()
+
+	data, err := json.MarshalIndent(bc.Blocks, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal blockchain: %v", err)
+	}
+
+	return ioutil.WriteFile(filename, data, 0644)
+}
+
+// LoadFromFile updates the blockchain by deserializing state from a disk file.
+func (bc *Blockchain) LoadFromFile(filename string) error {
+	bc.mu.Lock()
+	defer bc.mu.Unlock()
+
+	if _, err := os.Stat(filename); os.IsNotExist(err) {
+		return fmt.Errorf("file %s does not exist", filename)
+	}
+
+	data, err := ioutil.ReadFile(filename)
+	if err != nil {
+		return fmt.Errorf("failed to read blockchain file: %v", err)
+	}
+
+	var importedBlocks []*block.Block
+	if err := json.Unmarshal(data, &importedBlocks); err != nil {
+		return fmt.Errorf("failed to unmarshal blockchain file data: %v", err)
+	}
+
+	bc.Blocks = importedBlocks
+	return nil
 }

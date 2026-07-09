@@ -23,25 +23,25 @@ func TestTransactionRejection(t *testing.T) {
 	bc := NewBlockchain(2)
 
 	// 1. Add funds via faucet
-	_ = bc.AddTransaction(ledger.NewTransaction("faucet", "Amindya", 100.0))
+	_ = bc.AddTransaction(ledger.NewTransaction("faucet", "Bob", 100.0))
 	_, _ = bc.MinePendingBlock()
 
-	// 2. Test overspending (Amindya has 100, attempts to send 150)
-	err := bc.AddTransaction(ledger.NewTransaction("Amindya", "Bob", 150.0))
+	// 2. Test overspending (Bob has 100, attempts to send 150)
+	err := bc.AddTransaction(ledger.NewTransaction("Bob", "Bob", 150.0))
 	if err == nil {
 		t.Error("Expected error when overspending, but transaction was accepted")
 	}
 
 	// 3. Test malformed amount (negative value)
-	err = bc.AddTransaction(ledger.NewTransaction("Amindya", "Bob", -50.0))
+	err = bc.AddTransaction(ledger.NewTransaction("Bob", "Bob", -50.0))
 	if err == nil {
 		t.Error("Expected error for negative transaction amount, but it was accepted")
 	}
 
 	// Verify balance remains unchanged after failed transactions
 	balances := bc.GetBalances()
-	if balances["Amindya"] != 100.0 {
-		t.Errorf("Expected Amindya's balance to remain 100.0, got %.2f", balances["Amindya"])
+	if balances["Bob"] != 100.0 {
+		t.Errorf("Expected Bob's balance to remain 100.0, got %.2f", balances["Bob"])
 	}
 }
 
@@ -50,10 +50,10 @@ func TestTamperDetection(t *testing.T) {
 	bc := NewBlockchain(2)
 
 	// Build a small history
-	_ = bc.AddTransaction(ledger.NewTransaction("faucet", "Amindya", 200.0))
+	_ = bc.AddTransaction(ledger.NewTransaction("faucet", "Bob", 200.0))
 	_, _ = bc.MinePendingBlock()
 
-	_ = bc.AddTransaction(ledger.NewTransaction("Amindya", "Bob", 50.0))
+	_ = bc.AddTransaction(ledger.NewTransaction("Bob", "Bob", 50.0))
 	_, _ = bc.MinePendingBlock()
 
 	// Verify it validates initially

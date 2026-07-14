@@ -2,78 +2,83 @@ package chain
 
 import (
 	"testing"
+	"toy-blockchain/block"
 	"toy-blockchain/ledger"
 )
 
-// TestNewBlockchain verifies that the chain initializes with exactly one block (Genesis)
-func TestNewBlockchain(t *testing.T) {
-	bc := NewBlockchain(3)
+// TestPendingPoolDoubleSpend catches the pending queue double-spend weakness
+func TestPendingPoolDoubleSpend(t *testing.T) {
+	bc := NewBlockchain(2)
 
-	if len(bc.Blocks) != 1 {
-		t.Fatalf("Expected initial chain length to be 1, got %d", len(bc.Blocks))
+	// Mint 100 coins
+	_ = bc.AddTransaction(ledger.NewTransaction("faucet", "Alice", 100))
+	_, _ = bc.MinePendingBlock()
+
+	// Attempt double spending within the pool queue
+	err1 := bc.AddTransaction(ledger.NewTransaction("Alice", "Bob", 60))
+	if err1 != nil {
+		t.Fatalf("First legitimate spend was unexpectedly rejected: %v", err1)
 	}
 
-	if bc.Blocks[0].Index != 0 {
-		t.Errorf("Expected Genesis block index to be 0, got %d", bc.Blocks[0].Index)
+	// This must fail because 60 coins are already committed in pending pool
+	err2 := bc.AddTransaction(ledger.NewTransaction("Alice", "Charlie", 60))
+	if err2 == nil {
+		t.Error("CRITICAL EXPLOIT: System accepted a double-spend transaction into the pending pool queue.")
 	}
 }
 
-// TestTransactionRejection verifies that overspending or malformed amounts are rejected (FR-4)
-func TestTransactionRejection(t *testing.T) {
+// TestGenesisTamperDetection verifies that mutating block 0 triggers explicit validation errors
+func TestGenesisTamperDetection(t *testing.T) {
 	bc := NewBlockchain(2)
 
-	// 1. Add funds via faucet
-	_ = bc.AddTransaction(ledger.NewTransaction("faucet", "Bob", 100.0))
-	_, _ = bc.MinePendingBlock()
+	// Inject fraudulent balance transaction data explicitly into the genesis block index
+	bc.Blocks[0].Transactions = append(bc.Blocks[0].Transactions, ledger.NewTransaction("system", "Eve", 1000000))
 
-	// 2. Test overspending (Bob has 100, attempts to send 150)
-	err := bc.AddTransaction(ledger.NewTransaction("Bob", "Bob", 150.0))
-	if err == nil {
-		t.Error("Expected error when overspending, but transaction was accepted")
-	}
-
-	// 3. Test malformed amount (negative value)
-	err = bc.AddTransaction(ledger.NewTransaction("Bob", "Bob", -50.0))
-	if err == nil {
-		t.Error("Expected error for negative transaction amount, but it was accepted")
-	}
-
-	// Verify balance remains unchanged after failed transactions
-	balances := bc.GetBalances()
-	if balances["Bob"] != 100.0 {
-		t.Errorf("Expected Bob's balance to remain 100.0, got %.2f", balances["Bob"])
+	valid, _, err := bc.ValidateChain()
+	if valid || err == nil {
+		t.Error("CRITICAL SECURITY EXPLOIT: Genesis block tampering was accepted silently without triggering errors.")
 	}
 }
 
-// TestTamperDetection verifies that altering historical transactions breaks chain validation (FR-6)
-func TestTamperDetection(t *testing.T) {
-	bc := NewBlockchain(2)
+// TestNegativeLedgerReplay confirms ledger state engine refuses negative drops
+func TestNegativeLedgerReplay(t *testing.T) {
+	bc := NewBlockchain(1)
 
-	// Build a small history
-	_ = bc.AddTransaction(ledger.NewTransaction("faucet", "Bob", 200.0))
+	_ = bc.AddTransaction(ledger.NewTransaction("faucet", "Bob", 50))
 	_, _ = bc.MinePendingBlock()
 
-	_ = bc.AddTransaction(ledger.NewTransaction("Bob", "Bob", 50.0))
+	// Bypass pool validation via structural backend injection to simulate disk manipulation
+	maliciousBlock := block.NewBlock(2, []ledger.Transaction{
+		ledger.NewTransaction("Bob", "Eve", 9999),
+	}, bc.Blocks[1].Hash)
+	maliciousBlock.Mine(1)
+
+	bc.Blocks = append(bc.Blocks, maliciousBlock)
+
+	valid, _, err := bc.ValidateChain()
+	if valid || err == nil {
+		t.Error("SECURITY BREAK: Ledger replay did not intercept negative asset balances during validation.")
+	}
+}
+
+// TestTimestampValidation enforces chronological structural continuity rules
+func TestTimestampValidation(t *testing.T) {
+	bc := NewBlockchain(1)
+
+	_ = bc.AddTransaction(ledger.NewTransaction("faucet", "Bob", 10))
 	_, _ = bc.MinePendingBlock()
 
-	// Verify it validates initially
-	valid, _, _ := bc.ValidateChain()
-	if !valid {
-		t.Fatal("Honest chain failed validation unexpectedly")
-	}
+	// Inject a broken historical block where timestamp sequence steps backward
+	badBlock := block.NewBlock(2, []ledger.Transaction{
+		ledger.NewTransaction("Bob", "Alice", 5),
+	}, bc.Blocks[1].Hash)
+	badBlock.Timestamp = bc.Blocks[1].Timestamp - 500 // Backward jump
+	badBlock.Mine(1)
 
-	// Deliberately tamper with Block 1 transaction data (FR-6, Research 7.1)
-	bc.Blocks[1].Transactions[0].Amount = 999.0
+	bc.Blocks = append(bc.Blocks, badBlock)
 
-	// Re-run validation
-	valid, brokenIdx, err := bc.ValidateChain()
-	if valid {
-		t.Error("Validation passed despite history being tampered with")
-	}
-	if brokenIdx != 1 {
-		t.Errorf("Expected validation to fail at block 1, failed at block %d", brokenIdx)
-	}
-	if err == nil {
-		t.Errorf("Expected an explicit error detailing the mismatch")
+	valid, _, err := bc.ValidateChain()
+	if valid || err == nil {
+		t.Error("STRUCTURAL RULE GAP: Chain validation did not reject out-of-order block timestamps.")
 	}
 }

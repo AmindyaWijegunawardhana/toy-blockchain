@@ -32,8 +32,8 @@ func NewBlockchain(difficulty int) *Blockchain {
 }
 
 // GetBalances computes current account balances by traversing the entire chain history.
-func (bc *Blockchain) GetBalances() map[string]float64 {
-	balances := make(map[string]float64)
+func (bc *Blockchain) GetBalances() map[string]int64 {
+	balances := make(map[string]int64)
 
 	for _, b := range bc.Blocks {
 		for _, tx := range b.Transactions {
@@ -57,9 +57,18 @@ func (bc *Blockchain) AddTransaction(tx ledger.Transaction) error {
 
 	if tx.Sender != "faucet" && tx.Sender != "system" {
 		balances := bc.GetBalances()
-		if balances[tx.Sender] < tx.Amount {
-			return fmt.Errorf("insufficient funds: %s has balance of %.2f, attempted to send %.2f",
-				tx.Sender, balances[tx.Sender], tx.Amount)
+
+		// Subtract what's already pending in the pool to prevent double spending
+		availableBalance := balances[tx.Sender]
+		for _, pendingTx := range bc.PendingPool {
+			if pendingTx.Sender == tx.Sender {
+				availableBalance -= pendingTx.Amount
+			}
+		}
+
+		if availableBalance < tx.Amount {
+			return fmt.Errorf("insufficient funds (including pending pool): %s has %d, trying to spend %d",
+				tx.Sender, availableBalance, tx.Amount)
 		}
 	}
 

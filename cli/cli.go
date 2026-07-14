@@ -92,9 +92,9 @@ func (c *CLI) handleAddTransaction(parts []string) {
 
 	sender := parts[1]
 	recipient := parts[2]
-	amount, err := strconv.ParseFloat(parts[3], 64)
-	if err != nil {
-		fmt.Println("Error: Invalid amount value. Must be a valid floating-point number.")
+	amount, err := strconv.ParseInt(parts[3], 10, 64)
+	if err != nil || amount <= 0 {
+		fmt.Println("Error: Invalid amount value. Must be a valid integer coin unit.")
 		return
 	}
 
@@ -102,7 +102,7 @@ func (c *CLI) handleAddTransaction(parts []string) {
 	if err := c.bc.AddTransaction(tx); err != nil {
 		fmt.Printf("Transaction Rejected: %v\n", err)
 	} else {
-		fmt.Printf("Transaction queued successfully! (Sender: %s -> Recipient: %s | Amount: %.2f)\n", sender, recipient, amount)
+		fmt.Printf("Transaction queued successfully! (Sender: %s -> Recipient: %s | Amount: %d)\n", sender, recipient, amount)
 	}
 }
 
@@ -130,7 +130,7 @@ func (c *CLI) handleBalances() {
 		return
 	}
 	for account, balance := range balances {
-		fmt.Printf("  %s: %.2f\n", account, balance)
+		fmt.Printf("  %s: %d\n", account, balance)
 	}
 }
 
@@ -144,7 +144,7 @@ func (c *CLI) handlePrintChain() {
 		fmt.Printf("  Nonce:      %d\n", b.Nonce)
 		fmt.Printf("  Transactions (%d total):\n", len(b.Transactions))
 		for _, tx := range b.Transactions {
-			fmt.Printf("    - %s -> %s: %.2f\n", tx.Sender, tx.Recipient, tx.Amount)
+			fmt.Printf("    - %s -> %s: %d\n", tx.Sender, tx.Recipient, tx.Amount)
 		}
 	}
 }

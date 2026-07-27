@@ -12,6 +12,12 @@ import (
 	"toy-blockchain/ledger"
 )
 
+const (
+	BlockIntervalWindow = 4 // Recalculate difficulty every N blocks
+	TargetBlockTime     = 5 // Target time in seconds per block
+	TargetDuration      = BlockIntervalWindow * TargetBlockTime
+)
+
 // Blockchain manages the append-only ledger state.
 type Blockchain struct {
 	mu          sync.RWMutex
@@ -51,14 +57,20 @@ func (bc *Blockchain) AddTransaction(tx ledger.Transaction) error {
 	bc.mu.Lock()
 	defer bc.mu.Unlock()
 
+	// 1. Verify cryptographic authorization signature
+	if !tx.Verify() {
+		return errors.New("invalid transaction signature: unauthorized transfer execution")
+	}
+
+	// 2. Validate basic amount constraint
 	if tx.Amount <= 0 {
 		return errors.New("transaction amount must be positive")
 	}
 
+	// 3. Prevent double-spending against the unconfirmed pool queue
 	if tx.Sender != "faucet" && tx.Sender != "system" {
 		balances := bc.GetBalances()
 
-		// Subtract what's already pending in the pool to prevent double spending
 		availableBalance := balances[tx.Sender]
 		for _, pendingTx := range bc.PendingPool {
 			if pendingTx.Sender == tx.Sender {
@@ -76,7 +88,7 @@ func (bc *Blockchain) AddTransaction(tx ledger.Transaction) error {
 	return nil
 }
 
-// MinePendingBlock takes pending transactions, mines a new block, and updates the chain.
+// MinePendingBlock takes pending transactions, calculates next target difficulty, and mines a new block.
 func (bc *Blockchain) MinePendingBlock() (*block.Block, error) {
 	bc.mu.Lock()
 	defer bc.mu.Unlock()
@@ -86,8 +98,12 @@ func (bc *Blockchain) MinePendingBlock() (*block.Block, error) {
 	}
 
 	latestBlock := bc.Blocks[len(bc.Blocks)-1]
-	newBlock := block.NewBlock(latestBlock.Index+1, bc.PendingPool, latestBlock.Hash)
 
+	// Dynamic difficulty retargeting evaluation
+	nextDifficulty := bc.CalculateNextDifficulty(latestBlock.Index + 1)
+	bc.Difficulty = nextDifficulty
+
+	newBlock := block.NewBlock(latestBlock.Index+1, bc.PendingPool, latestBlock.Hash)
 	newBlock.Mine(bc.Difficulty)
 
 	bc.Blocks = append(bc.Blocks, newBlock)
@@ -96,13 +112,105 @@ func (bc *Blockchain) MinePendingBlock() (*block.Block, error) {
 	return newBlock, nil
 }
 
-// ValidateChain checks the integrity of the entire block history.
+// CalculateNextDifficulty returns the algorithmic dynamic difficulty factor for a given block height.
+func (bc *Blockchain) CalculateNextDifficulty(nextIndex int) int {
+	if nextIndex == 0 || nextIndex%BlockIntervalWindow != 0 {
+		return bc.Difficulty
+	}
+
+	lastAdjustmentBlock := bc.Blocks[nextIndex-BlockIntervalWindow]
+	latestBlock := bc.Blocks[nextIndex-1]
+
+	actualDuration := latestBlock.Timestamp - lastAdjustmentBlock.Timestamp
+	currentDiff := bc.Difficulty
+
+	if actualDuration < int64(TargetDuration/2) {
+		return currentDiff + 1
+	} else if actualDuration > int64(TargetDuration*2) {
+		if currentDiff > 1 {
+			return currentDiff - 1
+		}
+	}
+	return currentDiff
+}
+
+// ResolveFork replaces local chain with a competing chain if the competing chain is valid and strictly longer.
+func (bc *Blockchain) ResolveFork(competingBlocks []*block.Block) (bool, error) {
+	bc.mu.Lock()
+	defer bc.mu.Unlock()
+
+	// 1. Must be strictly longer to trigger reorg
+	if len(competingBlocks) <= len(bc.Blocks) {
+		return false, errors.New("competing chain is not longer than local chain")
+	}
+
+	// 2. Perform full structural validation on competing chain snapshot
+	tempChain := &Blockchain{
+		Blocks:     competingBlocks,
+		Difficulty: bc.Difficulty,
+	}
+
+	valid, brokenIdx, err := tempChain.ValidateChain()
+	if !valid {
+		return false, fmt.Errorf("competing chain failed validation at index %d: %v", brokenIdx, err)
+	}
+
+	// 3. Reorganization: Adopt longer chain & update pending pool
+	bc.Blocks = competingBlocks
+
+	confirmedTxs := make(map[string]bool)
+	for _, b := range bc.Blocks {
+		for _, tx := range b.Transactions {
+			if tx.Signature != "" {
+				confirmedTxs[tx.Signature] = true
+			}
+		}
+	}
+
+	newPending := make([]ledger.Transaction, 0)
+	for _, tx := range bc.PendingPool {
+		if !confirmedTxs[tx.Signature] {
+			newPending = append(newPending, tx)
+		}
+	}
+	bc.PendingPool = newPending
+
+	return true, nil
+}
+
+// ValidateChain checks the integrity of the entire block history including dynamic difficulty & Merkle rules.
 func (bc *Blockchain) ValidateChain() (bool, int, error) {
 	bc.mu.RLock()
 	defer bc.mu.RUnlock()
 
-	targetPrefix := strings.Repeat("0", bc.Difficulty)
+	if len(bc.Blocks) == 0 {
+		return false, 0, errors.New("blockchain is completely empty")
+	}
 
+	// 1. Validate Genesis Block Merkle integrity explicitly
+	genesisMerkle := bc.Blocks[0].CalculateMerkleRoot()
+	if bc.Blocks[0].MerkleRoot != genesisMerkle {
+		return false, 0, errors.New("genesis block transaction data tampered")
+	}
+
+	historicalBalances := make(map[string]int64)
+	expectedDifficulty := bc.Difficulty
+
+	// Process transactions for Genesis Block
+	for _, tx := range bc.Blocks[0].Transactions {
+		if !tx.Verify() {
+			return false, 0, fmt.Errorf("genesis block contains invalid cryptographic signatures")
+		}
+		if tx.Amount <= 0 {
+			return false, 0, fmt.Errorf("genesis block contains non-positive transaction amount: %d", tx.Amount)
+		}
+		if tx.Sender != "faucet" && tx.Sender != "system" {
+			historicalBalances[tx.Sender] -= tx.Amount
+		}
+		historicalBalances[tx.Recipient] += tx.Amount
+	}
+
+	// 2. Continuous history verification loop
 	for i := 1; i < len(bc.Blocks); i++ {
 		current := bc.Blocks[i]
 		previous := bc.Blocks[i-1]
@@ -111,18 +219,62 @@ func (bc *Blockchain) ValidateChain() (bool, int, error) {
 			return false, current.Index, fmt.Errorf("inconsistent block height at index %d", current.Index)
 		}
 
+		if current.Timestamp <= previous.Timestamp {
+			return false, current.Index, fmt.Errorf("timestamp sequence error at index %d: %d is not after %d", current.Index, current.Timestamp, previous.Timestamp)
+		}
+
 		if current.PrevHash != previous.Hash {
 			return false, current.Index, fmt.Errorf("broken hash link at index %d: expected %s, got %s",
 				current.Index, previous.Hash, current.PrevHash)
 		}
 
-		recalculatedHash := current.CalculateHash()
-		if current.Hash != recalculatedHash {
-			return false, current.Index, fmt.Errorf("hash mismatch at index %d: block data was modified", current.Index)
+		// Retargeting tracker rule validation
+		if current.Index%BlockIntervalWindow == 0 {
+			lastAdjustmentBlock := bc.Blocks[current.Index-BlockIntervalWindow]
+			actualDuration := previous.Timestamp - lastAdjustmentBlock.Timestamp
+
+			if actualDuration < int64(TargetDuration/2) {
+				expectedDifficulty++
+			} else if actualDuration > int64(TargetDuration*2) {
+				if expectedDifficulty > 1 {
+					expectedDifficulty--
+				}
+			}
 		}
 
+		// Verify block hash matches recorded header configuration
+		recalculatedHash := current.CalculateHash()
+		if current.Hash != recalculatedHash {
+			return false, current.Index, fmt.Errorf("hash mismatch at index %d: block header data was modified", current.Index)
+		}
+
+		// Verify Proof-of-Work prefix matches expected difficulty
+		targetPrefix := strings.Repeat("0", expectedDifficulty)
 		if !strings.HasPrefix(current.Hash, targetPrefix) {
-			return false, current.Index, fmt.Errorf("proof of work target unmet at index %d", current.Index)
+			return false, current.Index, fmt.Errorf("proof of work target unmet at index %d: expected diff %d", current.Index, expectedDifficulty)
+		}
+
+		// Verify Merkle Root summary integrity
+		actualMerkleRoot := current.CalculateMerkleRoot()
+		if current.MerkleRoot != actualMerkleRoot {
+			return false, current.Index, fmt.Errorf("merkle root mismatch at index %d: transaction data tampered", current.Index)
+		}
+
+		// Verify transactions and history replays
+		for _, tx := range current.Transactions {
+			if !tx.Verify() {
+				return false, current.Index, fmt.Errorf("cryptographic signature mismatch at index %d: unauthorized transfer", current.Index)
+			}
+			if tx.Amount <= 0 {
+				return false, current.Index, fmt.Errorf("block %d contains non-positive transaction amount: %d", current.Index, tx.Amount)
+			}
+			if tx.Sender != "faucet" && tx.Sender != "system" {
+				historicalBalances[tx.Sender] -= tx.Amount
+				if historicalBalances[tx.Sender] < 0 {
+					return false, current.Index, fmt.Errorf("block %d replay caused illegal negative balance for %s", current.Index, tx.Sender)
+				}
+			}
+			historicalBalances[tx.Recipient] += tx.Amount
 		}
 	}
 

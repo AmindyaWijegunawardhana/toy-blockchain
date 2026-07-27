@@ -2,95 +2,150 @@ package block
 
 import (
 	"crypto/sha256"
-	"encoding/json"
-	"fmt"
-	"strings"
+	"encoding/hex"
+	"runtime"
+	"strconv"
+	"sync/atomic"
 	"time"
 	"toy-blockchain/ledger"
 )
 
-// Block represents a single block in the append-only chain.
+// Block represents a single verified node in the blockchain.
 type Block struct {
 	Index        int                  `json:"index"`
 	Timestamp    int64                `json:"timestamp"`
-	Transactions []ledger.Transaction `json:"transactions"`
 	PrevHash     string               `json:"prev_hash"`
-	Nonce        int64                `json:"nonce"`
 	Hash         string               `json:"hash"`
-}
-
-// HashInput defines the structure used strictly for computing the block's hash.
-type HashInput struct {
-	Index        int                  `json:"index"`
-	Timestamp    int64                `json:"timestamp"`
+	Nonce        int                  `json:"nonce"`
 	Transactions []ledger.Transaction `json:"transactions"`
-	PrevHash     string               `json:"prev_hash"`
-	Nonce        int64                `json:"nonce"`
+	MerkleRoot   string               `json:"merkle_root"`
 }
 
-// NewBlock initializes a new block with the given parameters.
+// NewBlock constructs a fully populated block with a derived Merkle Root.
 func NewBlock(index int, transactions []ledger.Transaction, prevHash string) *Block {
 	b := &Block{
 		Index:        index,
 		Timestamp:    time.Now().Unix(),
-		Transactions: transactions,
 		PrevHash:     prevHash,
-		Nonce:        0,
+		Transactions: transactions,
 	}
-	b.Hash = b.CalculateHash()
+	b.MerkleRoot = b.CalculateMerkleRoot()
 	return b
 }
 
-// NewGenesisBlock generates the initial, deterministic block 0 of the chain.
+// NewGenesisBlock builds a static, deterministic starting block.
 func NewGenesisBlock() *Block {
+	genesisTx := ledger.NewTransaction("system", "faucet", 1000000)
+
 	b := &Block{
 		Index:        0,
-		Timestamp:    1719878400, // Fixed Unix timestamp
-		Transactions: []ledger.Transaction{},
+		Timestamp:    1700000000,
 		PrevHash:     "0000000000000000000000000000000000000000000000000000000000000000",
-		Nonce:        0,
+		Transactions: []ledger.Transaction{genesisTx},
 	}
+	b.MerkleRoot = b.CalculateMerkleRoot()
 	b.Hash = b.CalculateHash()
 	return b
 }
 
-// CalculateHash computes the SHA-256 hash over a stable JSON serialization.
-func (b *Block) CalculateHash() string {
-	input := HashInput{
-		Index:        b.Index,
-		Timestamp:    b.Timestamp,
-		Transactions: b.Transactions,
-		PrevHash:     b.PrevHash,
-		Nonce:        b.Nonce,
-	}
+// CalculateHashWithNonce computes the hash over header fields given a specific nonce value.
+func (b *Block) CalculateHashWithNonce(nonce int) string {
+	record := strconv.Itoa(b.Index) +
+		strconv.FormatInt(b.Timestamp, 10) +
+		b.PrevHash +
+		b.MerkleRoot +
+		strconv.Itoa(nonce)
 
-	data, err := json.Marshal(input)
-	if err != nil {
-		panic(fmt.Sprintf("failed to marshal block data: %v", err))
-	}
-
-	hash := sha256.Sum256(data)
-	return fmt.Sprintf("%x", hash)
+	hash := sha256.Sum256([]byte(record))
+	return hex.EncodeToString(hash[:])
 }
 
-// Mine increments the block's nonce until its SHA-256 hash satisfies
-// the proof-of-work difficulty target (N leading zero hex characters).
+// CalculateHash computes the block hash over header fields using the current internal Nonce state.
+func (b *Block) CalculateHash() string {
+	return b.CalculateHashWithNonce(b.Nonce)
+}
+
+// Mine searches the nonce space concurrently across multiple goroutines, stopping cleanly when one succeeds.
 func (b *Block) Mine(difficulty int) {
-	target := strings.Repeat("0", difficulty)
-	startTime := time.Now()
-
-	fmt.Printf("Mining block %d (Difficulty: %d)...\n", b.Index, difficulty)
-
-	for {
-		b.Hash = b.CalculateHash()
-		if strings.HasPrefix(b.Hash, target) {
-			break
-		}
-		b.Nonce++
+	target := ""
+	for i := 0; i < difficulty; i++ {
+		target += "0"
 	}
 
-	elapsed := time.Since(startTime)
-	fmt.Printf("Block %d successfully mined!\n", b.Index)
-	fmt.Printf("  Nonce found:  %d\n", b.Nonce)
-	fmt.Printf("  Time elapsed: %s\n\n", elapsed)
+	// Use all available logical CPU cores on the local machine
+	numWorkers := runtime.NumCPU()
+
+	// Create channels to handle success results safely
+	type MiningResult struct {
+		Nonce int
+		Hash  string
+	}
+	resultChan := make(chan MiningResult, 1)
+
+	// Thread-safe atomic flag to cleanly tell all other workers to stop spinning instantly
+	var found uint32 = 0
+
+	// Launch parallel workers across divided segments of the nonce range
+	for w := 0; w < numWorkers; w++ {
+		// Each worker starts at its worker index ID and jumps by the worker step factor
+		go func(workerID int, step int) {
+			currentNonce := workerID
+
+			for {
+				// Periodically check if another worker already hit the jackpot
+				if atomic.LoadUint32(&found) == 1 {
+					return
+				}
+
+				hash := b.CalculateHashWithNonce(currentNonce)
+				if hash[:difficulty] == target {
+					// Attempt to flip the atomic bit to claim the discovery victory
+					if atomic.CompareAndSwapUint32(&found, 0, 1) {
+						resultChan <- MiningResult{Nonce: currentNonce, Hash: hash}
+					}
+					return
+				}
+
+				// Increment by the total worker stride to prevent workers from cross-scanning duplicated nonces
+				currentNonce += step
+			}
+		}(w, numWorkers)
+	}
+
+	// Block until the winning result arrives from the fastest active thread
+	winningResult := <-resultChan
+
+	// Lock the winning metrics right into the primary block context configuration
+	b.Nonce = winningResult.Nonce
+	b.Hash = winningResult.Hash
+}
+
+// CalculateMerkleRoot recursively computes the Merkle Root of the block's transactions.
+func (b *Block) CalculateMerkleRoot() string {
+	if len(b.Transactions) == 0 {
+		emptyHash := sha256.Sum256([]byte(""))
+		return hex.EncodeToString(emptyHash[:])
+	}
+
+	var level [][]byte
+	for _, tx := range b.Transactions {
+		level = append(level, tx.GetHash())
+	}
+
+	for len(level) > 1 {
+		var nextLevel [][]byte
+
+		if len(level)%2 != 0 {
+			level = append(level, level[len(level)-1])
+		}
+
+		for i := 0; i < len(level); i += 2 {
+			concat := append(level[i], level[i+1]...)
+			parentHash := sha256.Sum256(concat)
+			nextLevel = append(nextLevel, parentHash[:])
+		}
+		level = nextLevel
+	}
+
+	return hex.EncodeToString(level[0])
 }

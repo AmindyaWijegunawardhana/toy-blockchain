@@ -1,24 +1,23 @@
 package ledger
 
 import (
-	"crypto/ecdsa"
-	"crypto/elliptic"
+	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
-	"math/big"
-	"strconv"
+	"fmt"
 )
 
-// Transaction represents a signed value transfer within the ledger.
+// Transaction represents an asset transfer between accounts.
 type Transaction struct {
 	Sender    string `json:"sender"`
 	Recipient string `json:"recipient"`
 	Amount    int64  `json:"amount"`
-	Signature string `json:"signature,omitempty"`
+	Signature string `json:"signature"`
+	PubBytes  string `json:"public_key"` // Hex-encoded Ed25519 sender public key
 }
 
-// NewTransaction constructs a new transaction instance.
+// NewTransaction creates an unsigned transaction.
 func NewTransaction(sender, recipient string, amount int64) Transaction {
 	return Transaction{
 		Sender:    sender,
@@ -27,82 +26,64 @@ func NewTransaction(sender, recipient string, amount int64) Transaction {
 	}
 }
 
-// GetHash generates a clean SHA-256 hash of the transaction components.
+// GetHash calculates the SHA-256 hash of the transaction data fields.
 func (tx *Transaction) GetHash() []byte {
-	record := strconv.FormatInt(tx.Amount, 10) + tx.Sender + tx.Recipient
+	record := fmt.Sprintf("%s:%s:%d", tx.Sender, tx.Recipient, tx.Amount)
 	hash := sha256.Sum256([]byte(record))
 	return hash[:]
 }
 
-// Sign uses the sender's private key to sign the transaction hash.
-func (tx *Transaction) Sign(privKey *ecdsa.PrivateKey) error {
-	txHash := tx.GetHash()
-	r, s, err := ecdsa.Sign(rand.Reader, privKey, txHash)
+// GenerateKeyPair generates a fresh Ed25519 public/private keypair.
+func GenerateKeyPair() (ed25519.PrivateKey, ed25519.PublicKey, error) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
+	return priv, pub, nil
+}
 
-	// Secure padding: Allocate exactly 32 bytes for both R and S coordinates
-	rBuf := make([]byte, 32)
-	sBuf := make([]byte, 32)
-	r.FillBytes(rBuf)
-	s.FillBytes(sBuf)
+// Sign signs the transaction hash using an Ed25519 private key.
+func (tx *Transaction) Sign(priv ed25519.PrivateKey) error {
+	hash := tx.GetHash()
+	sig := ed25519.Sign(priv, hash)
+	tx.Signature = hex.EncodeToString(sig)
 
-	signatureBytes := append(rBuf, sBuf...)
-	tx.Signature = hex.EncodeToString(signatureBytes)
+	pubKey := priv.Public().(ed25519.PublicKey)
+	tx.PubBytes = hex.EncodeToString(pubKey)
 	return nil
 }
 
-// Verify checks if the transaction signature matches the sender's public key hex string.
+// Verify checks the cryptographic Ed25519 signature and enforces sender identity matches public key.
 func (tx *Transaction) Verify() bool {
 	if tx.Sender == "faucet" || tx.Sender == "system" {
-		return true
+		return true // Allow protocol minting / Genesis transactions
 	}
-	if tx.Signature == "" {
+
+	if tx.Signature == "" || tx.PubBytes == "" {
 		return false
 	}
 
-	pubKeyBytes, err := hex.DecodeString(tx.Sender)
-	if err != nil || len(pubKeyBytes) != 64 { // Must be exactly 32 + 32 bytes
+	// 🔒 Security Gate: The public key attached MUST match the declared sender address!
+	if tx.Sender != tx.PubBytes {
 		return false
 	}
-
-	// Safely split fixed 32-byte chunks
-	xBytes, yBytes := pubKeyBytes[:32], pubKeyBytes[32:]
-	x := new(big.Int).SetBytes(xBytes)
-	y := new(big.Int).SetBytes(yBytes)
-
-	curve := elliptic.P256()
-	pubKey := &ecdsa.PublicKey{Curve: curve, X: x, Y: y}
 
 	sigBytes, err := hex.DecodeString(tx.Signature)
-	if err != nil || len(sigBytes) != 64 { // Must be exactly 32 + 32 bytes
+	if err != nil {
 		return false
 	}
 
-	rBytes, sBytes := sigBytes[:32], sigBytes[32:]
-	r := new(big.Int).SetBytes(rBytes)
-	s := new(big.Int).SetBytes(sBytes)
-
-	return ecdsa.Verify(pubKey, tx.GetHash(), r, s)
-}
-
-// GenerateKeyPair outputs a valid ECDSA wallet key pair with fixed 32-byte field padding.
-func GenerateKeyPair() (*ecdsa.PrivateKey, string, error) {
-	curve := elliptic.P256()
-	privKey, err := ecdsa.GenerateKey(curve, rand.Reader)
+	pubBytes, err := hex.DecodeString(tx.PubBytes)
 	if err != nil {
-		return nil, "", err
+		return false
 	}
 
-	// Secure padding: Allocate exactly 32 bytes for X and Y coordinates
-	xBuf := make([]byte, 32)
-	yBuf := make([]byte, 32)
-	privKey.PublicKey.X.FillBytes(xBuf)
-	privKey.PublicKey.Y.FillBytes(yBuf)
+	if len(pubBytes) != ed25519.PublicKeySize || len(sigBytes) != ed25519.SignatureSize {
+		return false
+	}
 
-	pubKeyBytes := append(xBuf, yBuf...)
-	pubKeyHex := hex.EncodeToString(pubKeyBytes)
+	pubKey := ed25519.PublicKey(pubBytes)
+	hash := tx.GetHash()
 
-	return privKey, pubKeyHex, nil
+	return ed25519.Verify(pubKey, hash, sigBytes)
 }

@@ -1,6 +1,7 @@
 package chain
 
 import (
+	"encoding/hex"
 	"testing"
 	"toy-blockchain/block"
 	"toy-blockchain/ledger"
@@ -14,12 +15,15 @@ func TestPendingPoolDoubleSpend(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to generate keys: %v", err)
 	}
+	alicePubHex := hex.EncodeToString(alicePub)
 
-	_ = bc.AddTransaction(ledger.NewTransaction("faucet", alicePub, 100))
+	_ = bc.AddTransaction(ledger.NewTransaction("faucet", alicePubHex, 100))
 	_, _ = bc.MinePendingBlock()
 
 	alicePriv, alicePubReal, _ := ledger.GenerateKeyPair()
-	_ = bc.AddTransaction(ledger.NewTransaction("faucet", alicePubReal, 100))
+	alicePubRealHex := hex.EncodeToString(alicePubReal)
+
+	_ = bc.AddTransaction(ledger.NewTransaction("faucet", alicePubRealHex, 100))
 
 	latestBlock := bc.Blocks[len(bc.Blocks)-1]
 	b := block.NewBlock(latestBlock.Index+1, bc.PendingPool, latestBlock.Hash)
@@ -31,7 +35,7 @@ func TestPendingPoolDoubleSpend(t *testing.T) {
 	bc.PendingPool = make([]ledger.Transaction, 0)
 	bc.mu.Unlock()
 
-	tx1 := ledger.NewTransaction(alicePubReal, "Bob", 60)
+	tx1 := ledger.NewTransaction(alicePubRealHex, "Bob", 60)
 	if err := tx1.Sign(alicePriv); err != nil {
 		t.Fatalf("Signing failed: %v", err)
 	}
@@ -41,7 +45,7 @@ func TestPendingPoolDoubleSpend(t *testing.T) {
 		t.Fatalf("First legitimate spend was unexpectedly rejected: %v", err1)
 	}
 
-	tx2 := ledger.NewTransaction(alicePubReal, "Charlie", 60)
+	tx2 := ledger.NewTransaction(alicePubRealHex, "Charlie", 60)
 	if err := tx2.Sign(alicePriv); err != nil {
 		t.Fatalf("Signing failed: %v", err)
 	}
@@ -114,8 +118,9 @@ func TestSignatureVerificationAndIdentityForgery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to generate keys: %v", err)
 	}
+	alicePubHex := hex.EncodeToString(alicePub)
 
-	tx1 := ledger.NewTransaction("faucet", alicePub, 500)
+	tx1 := ledger.NewTransaction("faucet", alicePubHex, 500)
 	err = bc.AddTransaction(tx1)
 	if err != nil {
 		t.Fatalf("Failed to add funding tx: %v", err)
@@ -132,7 +137,9 @@ func TestSignatureVerificationAndIdentityForgery(t *testing.T) {
 	bc.mu.Unlock()
 
 	_, bobPub, _ := ledger.GenerateKeyPair()
-	tx2 := ledger.NewTransaction(alicePub, bobPub, 200)
+	bobPubHex := hex.EncodeToString(bobPub)
+
+	tx2 := ledger.NewTransaction(alicePubHex, bobPubHex, 200)
 
 	err = tx2.Sign(alicePriv)
 	if err != nil {
@@ -159,7 +166,7 @@ func TestSignatureVerificationAndIdentityForgery(t *testing.T) {
 		t.Fatalf("Blockchain rejected valid cryptographic signatures at block index %d: %v", brokenIdx, valErr)
 	}
 
-	maliciousTx := ledger.NewTransaction(alicePub, bobPub, 50)
+	maliciousTx := ledger.NewTransaction(alicePubHex, bobPubHex, 50)
 	attackerPriv, _, _ := ledger.GenerateKeyPair()
 
 	_ = maliciousTx.Sign(attackerPriv)
@@ -178,22 +185,18 @@ func TestSignatureVerificationAndIdentityForgery(t *testing.T) {
 }
 
 // TestDifficultyRetargeting confirms that mining complexity shifts dynamically to match block production speed
-// TestDifficultyRetargeting confirms that mining complexity shifts dynamically to match block production speed
-// TestDifficultyRetargeting confirms that mining complexity shifts dynamically to match block production speed
-// TestDifficultyRetargeting confirms that mining complexity shifts dynamically to match block production speed
-// TestDifficultyRetargeting confirms that mining complexity shifts dynamically to match block production speed
 func TestDifficultyRetargeting(t *testing.T) {
-	bc := NewBlockchain(1) // Initial chain difficulty baseline is 1
+	bc := NewBlockchain(1)
 
 	_, alicePub, _ := ledger.GenerateKeyPair()
+	alicePubHex := hex.EncodeToString(alicePub)
 
-	// Mine blocks 1 through 4 manually with fast 1-second intervals
 	for i := 1; i <= 4; i++ {
-		_ = bc.AddTransaction(ledger.NewTransaction("faucet", alicePub, int64(i*10)))
+		_ = bc.AddTransaction(ledger.NewTransaction("faucet", alicePubHex, int64(i*10)))
 
 		latestBlock := bc.Blocks[len(bc.Blocks)-1]
 		b := block.NewBlock(latestBlock.Index+1, bc.PendingPool, latestBlock.Hash)
-		b.Timestamp = latestBlock.Timestamp + 1 // Fast 1-second interval
+		b.Timestamp = latestBlock.Timestamp + 1
 
 		targetDiff := bc.CalculateNextDifficulty(b.Index)
 		b.Mine(targetDiff)
@@ -204,13 +207,11 @@ func TestDifficultyRetargeting(t *testing.T) {
 		bc.mu.Unlock()
 	}
 
-	// At block index 4, retargeting calculates that the NEXT block (5) should be difficulty 2
 	nextDiff := bc.CalculateNextDifficulty(4)
 	if nextDiff <= 1 {
 		t.Errorf("RETARGETING FAILURE: Expected difficulty to scale up due to hyper-fast block generation velocity, but stayed at %d", nextDiff)
 	}
 
-	// Keep bc.Difficulty aligned with starting state for replay verification
 	bc.Difficulty = 1
 
 	valid, brokenIdx, err := bc.ValidateChain()
@@ -223,8 +224,9 @@ func TestDifficultyRetargeting(t *testing.T) {
 func TestForkResolution(t *testing.T) {
 	localBC := NewBlockchain(1)
 	_, alicePub, _ := ledger.GenerateKeyPair()
+	alicePubHex := hex.EncodeToString(alicePub)
 
-	_ = localBC.AddTransaction(ledger.NewTransaction("faucet", alicePub, 100))
+	_ = localBC.AddTransaction(ledger.NewTransaction("faucet", alicePubHex, 100))
 	b1Local, err := localBC.MinePendingBlock()
 	if err != nil || b1Local == nil {
 		t.Fatalf("Failed to mine initial local block: %v", err)
@@ -232,8 +234,9 @@ func TestForkResolution(t *testing.T) {
 
 	competingBC := NewBlockchain(1)
 	_, bobPub, _ := ledger.GenerateKeyPair()
+	bobPubHex := hex.EncodeToString(bobPub)
 
-	_ = competingBC.AddTransaction(ledger.NewTransaction("faucet", bobPub, 200))
+	_ = competingBC.AddTransaction(ledger.NewTransaction("faucet", bobPubHex, 200))
 	b1Comp, err := competingBC.MinePendingBlock()
 	if err != nil || b1Comp == nil {
 		t.Fatalf("Failed to mine competing block 1: %v", err)
@@ -263,8 +266,7 @@ func TestForkResolution(t *testing.T) {
 	copy(invalidBlocks, competingBC.Blocks)
 
 	lastBlock := invalidBlocks[len(invalidBlocks)-1]
-	// Attempt an unauthorized transfer from Alice to Eve without sufficient balance or valid signatures
-	forgedTx := ledger.NewTransaction(alicePub, "Eve", 999999)
+	forgedTx := ledger.NewTransaction(alicePubHex, "Eve", 999999)
 	badBlock := block.NewBlock(lastBlock.Index+1, []ledger.Transaction{forgedTx}, lastBlock.Hash)
 	badBlock.Timestamp = lastBlock.Timestamp + 1
 	badBlock.Mine(1)

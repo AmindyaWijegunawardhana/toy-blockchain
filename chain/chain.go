@@ -4,315 +4,258 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"strings"
 	"sync"
+	"time"
+
 	"toy-blockchain/block"
 	"toy-blockchain/ledger"
 )
 
-const (
-	BlockIntervalWindow = 4 // Recalculate difficulty every N blocks
-	TargetBlockTime     = 5 // Target time in seconds per block
-	TargetDuration      = BlockIntervalWindow * TargetBlockTime
-)
-
-// Blockchain manages the append-only ledger state.
+// Blockchain manages the sequential chain of blocks and ledger state.
 type Blockchain struct {
-	mu          sync.RWMutex
-	Blocks      []*block.Block
-	PendingPool []ledger.Transaction
-	Difficulty  int
+	Blocks              []*block.Block
+	PendingTransactions []ledger.Transaction
+	Difficulty          int
+	mu                  sync.RWMutex
 }
 
-// NewBlockchain initializes a new chain with a deterministic Genesis block.
+// NewBlockchain creates a new chain instance with a Genesis block.
 func NewBlockchain(difficulty int) *Blockchain {
-	bc := &Blockchain{
-		Blocks:      make([]*block.Block, 0),
-		PendingPool: make([]ledger.Transaction, 0),
-		Difficulty:  difficulty,
+	genesis := &block.Block{
+		Index:        0,
+		Timestamp:    0,
+		Transactions: []ledger.Transaction{},
+		PrevHash:     "0",
+		Nonce:        0,
 	}
-	bc.Blocks = append(bc.Blocks, block.NewGenesisBlock())
-	return bc
+	genesis.Mine(difficulty)
+
+	return &Blockchain{
+		Blocks:              []*block.Block{genesis},
+		PendingTransactions: make([]ledger.Transaction, 0),
+		Difficulty:          difficulty,
+	}
 }
 
-// GetBalances computes current account balances by traversing the entire chain history.
-func (bc *Blockchain) GetBalances() map[string]int64 {
-	balances := make(map[string]int64)
+// LatestBlock returns a thread-safe copy of the most recent block on the chain.
+func (bc *Blockchain) LatestBlock() *block.Block {
+	bc.mu.RLock()
+	defer bc.mu.RUnlock()
 
+	tip := bc.Blocks[len(bc.Blocks)-1]
+	copied := *tip
+	return &copied
+}
+
+// GetBlocks returns a thread-safe shallow copy slice of the current block pointers.
+func (bc *Blockchain) GetBlocks() []*block.Block {
+	bc.mu.RLock()
+	defer bc.mu.RUnlock()
+
+	blocksCopy := make([]*block.Block, len(bc.Blocks))
+	copy(blocksCopy, bc.Blocks)
+	return blocksCopy
+}
+
+// BlockCount returns the current length of the chain.
+func (bc *Blockchain) BlockCount() int {
+	bc.mu.RLock()
+	defer bc.mu.RUnlock()
+	return len(bc.Blocks)
+}
+
+// AddBlock appends a validated block directly to the chain.
+func (bc *Blockchain) AddBlock(b *block.Block) {
+	bc.mu.Lock()
+	defer bc.mu.Unlock()
+	bc.Blocks = append(bc.Blocks, b)
+}
+
+// AddTransaction stages a new transaction into the pending transaction pool.
+func (bc *Blockchain) AddTransaction(tx ledger.Transaction) error {
+	bc.mu.Lock()
+	defer bc.mu.Unlock()
+
+	bc.PendingTransactions = append(bc.PendingTransactions, tx)
+	return nil
+}
+
+// MinePendingBlock packages pending transactions into a new block and mines it.
+func (bc *Blockchain) MinePendingBlock() (*block.Block, error) {
+	bc.mu.Lock()
+	defer bc.mu.Unlock()
+
+	tip := bc.Blocks[len(bc.Blocks)-1]
+	txsCopy := make([]ledger.Transaction, len(bc.PendingTransactions))
+	copy(txsCopy, bc.PendingTransactions)
+
+	newBlock := &block.Block{
+		Index:        tip.Index + 1,
+		Timestamp:    time.Now().UnixNano(),
+		Transactions: txsCopy,
+		PrevHash:     tip.Hash,
+		Nonce:        0,
+	}
+
+	newBlock.Mine(bc.Difficulty)
+	bc.Blocks = append(bc.Blocks, newBlock)
+	bc.PendingTransactions = make([]ledger.Transaction, 0)
+	return newBlock, nil
+}
+
+// ValidateChain validates the current chain or a candidate chain from Genesis to tip.
+func (bc *Blockchain) ValidateChain(chains ...[]*block.Block) (bool, error) {
+	bc.mu.RLock()
+	targetChain := bc.Blocks
+	if len(chains) > 0 && chains[0] != nil {
+		targetChain = chains[0]
+	}
+	diff := bc.Difficulty
+	bc.mu.RUnlock()
+
+	return validateChainList(targetChain, diff)
+}
+
+func validateChainList(targetChain []*block.Block, diff int) (bool, error) {
+	if len(targetChain) == 0 {
+		return false, errors.New("chain is empty")
+	}
+
+	if targetChain[0].PrevHash != "0" {
+		return false, errors.New("invalid genesis previous hash")
+	}
+
+	targetPrefix := strings.Repeat("0", diff)
+
+	for i := 1; i < len(targetChain); i++ {
+		prev := targetChain[i-1]
+		curr := targetChain[i]
+
+		if curr.Index != prev.Index+1 {
+			return false, fmt.Errorf("block %d has invalid index sequence", curr.Index)
+		}
+		if curr.PrevHash != prev.Hash {
+			return false, fmt.Errorf("block %d prev hash mismatch", curr.Index)
+		}
+		if curr.CalculateHash() != curr.Hash {
+			return false, fmt.Errorf("block %d hash mismatch", curr.Index)
+		}
+		if !strings.HasPrefix(curr.Hash, targetPrefix) {
+			return false, fmt.Errorf("block %d does not satisfy difficulty %d", curr.Index, diff)
+		}
+	}
+	return true, nil
+}
+
+// GetBalances calculates and returns all ledger account balances.
+func (bc *Blockchain) GetBalances() map[string]int64 {
+	return bc.RebuildLedgerBalances()
+}
+
+// RebuildLedgerBalances calculates full account balances based on the active chain transactions.
+func (bc *Blockchain) RebuildLedgerBalances() map[string]int64 {
+	bc.mu.RLock()
+	defer bc.mu.RUnlock()
+
+	balances := make(map[string]int64)
 	for _, b := range bc.Blocks {
 		for _, tx := range b.Transactions {
-			if tx.Sender != "faucet" && tx.Sender != "system" {
+			if tx.Sender != "" {
 				balances[tx.Sender] -= tx.Amount
 			}
-			balances[tx.Recipient] += tx.Amount
+			if tx.Recipient != "" {
+				balances[tx.Recipient] += tx.Amount
+			}
 		}
 	}
 	return balances
 }
 
-// AddTransaction validates and adds a transaction to the pending pool.
-func (bc *Blockchain) AddTransaction(tx ledger.Transaction) error {
-	bc.mu.Lock()
-	defer bc.mu.Unlock()
-
-	// 1. Verify cryptographic authorization signature
-	if !tx.Verify() {
-		return errors.New("invalid transaction signature: unauthorized transfer execution")
-	}
-
-	// 2. Validate basic amount constraint
-	if tx.Amount <= 0 {
-		return errors.New("transaction amount must be positive")
-	}
-
-	// 3. Prevent double-spending against the unconfirmed pool queue
-	if tx.Sender != "faucet" && tx.Sender != "system" {
-		balances := bc.GetBalances()
-
-		availableBalance := balances[tx.Sender]
-		for _, pendingTx := range bc.PendingPool {
-			if pendingTx.Sender == tx.Sender {
-				availableBalance -= pendingTx.Amount
-			}
-		}
-
-		if availableBalance < tx.Amount {
-			return fmt.Errorf("insufficient funds (including pending pool): %s has %d, trying to spend %d",
-				tx.Sender, availableBalance, tx.Amount)
-		}
-	}
-
-	bc.PendingPool = append(bc.PendingPool, tx)
-	return nil
-}
-
-// MinePendingBlock takes pending transactions, calculates next target difficulty, and mines a new block.
-func (bc *Blockchain) MinePendingBlock() (*block.Block, error) {
-	bc.mu.Lock()
-	defer bc.mu.Unlock()
-
-	if len(bc.PendingPool) == 0 {
-		return nil, errors.New("no pending transactions to mine")
-	}
-
-	latestBlock := bc.Blocks[len(bc.Blocks)-1]
-
-	// Dynamic difficulty retargeting evaluation
-	nextDifficulty := bc.CalculateNextDifficulty(latestBlock.Index + 1)
-	bc.Difficulty = nextDifficulty
-
-	newBlock := block.NewBlock(latestBlock.Index+1, bc.PendingPool, latestBlock.Hash)
-	newBlock.Mine(bc.Difficulty)
-
-	bc.Blocks = append(bc.Blocks, newBlock)
-	bc.PendingPool = make([]ledger.Transaction, 0)
-
-	return newBlock, nil
-}
-
-// CalculateNextDifficulty returns the algorithmic dynamic difficulty factor for a given block height.
-func (bc *Blockchain) CalculateNextDifficulty(nextIndex int) int {
-	if nextIndex == 0 || nextIndex%BlockIntervalWindow != 0 {
-		return bc.Difficulty
-	}
-
-	lastAdjustmentBlock := bc.Blocks[nextIndex-BlockIntervalWindow]
-	latestBlock := bc.Blocks[nextIndex-1]
-
-	actualDuration := latestBlock.Timestamp - lastAdjustmentBlock.Timestamp
-	currentDiff := bc.Difficulty
-
-	if actualDuration < int64(TargetDuration/2) {
-		return currentDiff + 1
-	} else if actualDuration > int64(TargetDuration*2) {
-		if currentDiff > 1 {
-			return currentDiff - 1
-		}
-	}
-	return currentDiff
-}
-
-// ResolveFork replaces local chain with a competing chain if the competing chain is valid and strictly longer.
-func (bc *Blockchain) ResolveFork(competingBlocks []*block.Block) (bool, error) {
-	bc.mu.Lock()
-	defer bc.mu.Unlock()
-
-	// 1. Must be strictly longer to trigger reorg
-	if len(competingBlocks) <= len(bc.Blocks) {
-		return false, errors.New("competing chain is not longer than local chain")
-	}
-
-	// 2. Perform full structural validation on competing chain snapshot
-	tempChain := &Blockchain{
-		Blocks:     competingBlocks,
-		Difficulty: bc.Difficulty,
-	}
-
-	valid, brokenIdx, err := tempChain.ValidateChain()
-	if !valid {
-		return false, fmt.Errorf("competing chain failed validation at index %d: %v", brokenIdx, err)
-	}
-
-	// 3. Reorganization: Adopt longer chain & update pending pool
-	bc.Blocks = competingBlocks
-
-	confirmedTxs := make(map[string]bool)
-	for _, b := range bc.Blocks {
-		for _, tx := range b.Transactions {
-			if tx.Signature != "" {
-				confirmedTxs[tx.Signature] = true
-			}
-		}
-	}
-
-	newPending := make([]ledger.Transaction, 0)
-	for _, tx := range bc.PendingPool {
-		if !confirmedTxs[tx.Signature] {
-			newPending = append(newPending, tx)
-		}
-	}
-	bc.PendingPool = newPending
-
-	return true, nil
-}
-
-// ValidateChain checks the integrity of the entire block history including dynamic difficulty & Merkle rules.
-func (bc *Blockchain) ValidateChain() (bool, int, error) {
-	bc.mu.RLock()
-	defer bc.mu.RUnlock()
-
-	if len(bc.Blocks) == 0 {
-		return false, 0, errors.New("blockchain is completely empty")
-	}
-
-	// 1. Validate Genesis Block Merkle integrity explicitly
-	genesisMerkle := bc.Blocks[0].CalculateMerkleRoot()
-	if bc.Blocks[0].MerkleRoot != genesisMerkle {
-		return false, 0, errors.New("genesis block transaction data tampered")
-	}
-
-	historicalBalances := make(map[string]int64)
-	expectedDifficulty := bc.Difficulty
-
-	// Process transactions for Genesis Block
-	for _, tx := range bc.Blocks[0].Transactions {
-		if !tx.Verify() {
-			return false, 0, fmt.Errorf("genesis block contains invalid cryptographic signatures")
-		}
-		if tx.Amount <= 0 {
-			return false, 0, fmt.Errorf("genesis block contains non-positive transaction amount: %d", tx.Amount)
-		}
-		if tx.Sender != "faucet" && tx.Sender != "system" {
-			historicalBalances[tx.Sender] -= tx.Amount
-		}
-		historicalBalances[tx.Recipient] += tx.Amount
-	}
-
-	// 2. Continuous history verification loop
-	for i := 1; i < len(bc.Blocks); i++ {
-		current := bc.Blocks[i]
-		previous := bc.Blocks[i-1]
-
-		if current.Index != previous.Index+1 {
-			return false, current.Index, fmt.Errorf("inconsistent block height at index %d", current.Index)
-		}
-
-		if current.Timestamp <= previous.Timestamp {
-			return false, current.Index, fmt.Errorf("timestamp sequence error at index %d: %d is not after %d", current.Index, current.Timestamp, previous.Timestamp)
-		}
-
-		if current.PrevHash != previous.Hash {
-			return false, current.Index, fmt.Errorf("broken hash link at index %d: expected %s, got %s",
-				current.Index, previous.Hash, current.PrevHash)
-		}
-
-		// Retargeting tracker rule validation
-		if current.Index%BlockIntervalWindow == 0 {
-			lastAdjustmentBlock := bc.Blocks[current.Index-BlockIntervalWindow]
-			actualDuration := previous.Timestamp - lastAdjustmentBlock.Timestamp
-
-			if actualDuration < int64(TargetDuration/2) {
-				expectedDifficulty++
-			} else if actualDuration > int64(TargetDuration*2) {
-				if expectedDifficulty > 1 {
-					expectedDifficulty--
-				}
-			}
-		}
-
-		// Verify block hash matches recorded header configuration
-		recalculatedHash := current.CalculateHash()
-		if current.Hash != recalculatedHash {
-			return false, current.Index, fmt.Errorf("hash mismatch at index %d: block header data was modified", current.Index)
-		}
-
-		// Verify Proof-of-Work prefix matches expected difficulty
-		targetPrefix := strings.Repeat("0", expectedDifficulty)
-		if !strings.HasPrefix(current.Hash, targetPrefix) {
-			return false, current.Index, fmt.Errorf("proof of work target unmet at index %d: expected diff %d", current.Index, expectedDifficulty)
-		}
-
-		// Verify Merkle Root summary integrity
-		actualMerkleRoot := current.CalculateMerkleRoot()
-		if current.MerkleRoot != actualMerkleRoot {
-			return false, current.Index, fmt.Errorf("merkle root mismatch at index %d: transaction data tampered", current.Index)
-		}
-
-		// Verify transactions and history replays
-		for _, tx := range current.Transactions {
-			if !tx.Verify() {
-				return false, current.Index, fmt.Errorf("cryptographic signature mismatch at index %d: unauthorized transfer", current.Index)
-			}
-			if tx.Amount <= 0 {
-				return false, current.Index, fmt.Errorf("block %d contains non-positive transaction amount: %d", current.Index, tx.Amount)
-			}
-			if tx.Sender != "faucet" && tx.Sender != "system" {
-				historicalBalances[tx.Sender] -= tx.Amount
-				if historicalBalances[tx.Sender] < 0 {
-					return false, current.Index, fmt.Errorf("block %d replay caused illegal negative balance for %s", current.Index, tx.Sender)
-				}
-			}
-			historicalBalances[tx.Recipient] += tx.Amount
-		}
-	}
-
-	return true, 0, nil
-}
-
-// SaveToFile serializes the blockchain and writes it out to disk.
+// SaveToFile serializes the blockchain state to a JSON file.
 func (bc *Blockchain) SaveToFile(filename string) error {
 	bc.mu.RLock()
 	defer bc.mu.RUnlock()
 
-	data, err := json.MarshalIndent(bc.Blocks, "", "  ")
+	data, err := json.MarshalIndent(bc, "", "  ")
 	if err != nil {
-		return fmt.Errorf("failed to marshal blockchain: %v", err)
+		return err
 	}
-
-	return ioutil.WriteFile(filename, data, 0644)
+	return os.WriteFile(filename, data, 0644)
 }
 
-// LoadFromFile updates the blockchain by deserializing state from a disk file.
+// LoadFromFile loads the blockchain state from a JSON file.
 func (bc *Blockchain) LoadFromFile(filename string) error {
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		return err
+	}
+
 	bc.mu.Lock()
 	defer bc.mu.Unlock()
 
-	if _, err := os.Stat(filename); os.IsNotExist(err) {
-		return fmt.Errorf("file %s does not exist", filename)
+	var loaded Blockchain
+	if err := json.Unmarshal(data, &loaded); err != nil {
+		return err
 	}
 
-	data, err := ioutil.ReadFile(filename)
-	if err != nil {
-		return fmt.Errorf("failed to read blockchain file: %v", err)
-	}
-
-	var importedBlocks []*block.Block
-	if err := json.Unmarshal(data, &importedBlocks); err != nil {
-		return fmt.Errorf("failed to unmarshal blockchain file data: %v", err)
-	}
-
-	bc.Blocks = importedBlocks
+	bc.Blocks = loaded.Blocks
+	bc.PendingTransactions = loaded.PendingTransactions
+	bc.Difficulty = loaded.Difficulty
 	return nil
+}
+
+// ResolveFork compares candidate chain against current chain.
+func (bc *Blockchain) ResolveFork(candidateChain []*block.Block) (bool, []ledger.Transaction, error) {
+	bc.mu.Lock()
+	defer bc.mu.Unlock()
+
+	if len(candidateChain) <= len(bc.Blocks) {
+		return false, nil, nil
+	}
+
+	valid, err := validateChainList(candidateChain, bc.Difficulty)
+	if !valid || err != nil {
+		return false, nil, fmt.Errorf("candidate chain invalid: %w", err)
+	}
+
+	// Index hashes of all candidate blocks
+	candidateBlockHashes := make(map[string]bool)
+	for _, b := range candidateChain {
+		candidateBlockHashes[b.Hash] = true
+	}
+
+	// Index all transactions in candidate chain by signature or payload
+	candidateTxs := make(map[string]bool)
+	for _, b := range candidateChain {
+		for _, tx := range b.Transactions {
+			key := tx.Signature
+			if key == "" {
+				key = fmt.Sprintf("%s:%s:%d", tx.Sender, tx.Recipient, tx.Amount)
+			}
+			candidateTxs[key] = true
+		}
+	}
+
+	// Find all orphaned transactions from local blocks that are NOT in candidateChain
+	orphanedTxs := make([]ledger.Transaction, 0)
+	for _, b := range bc.Blocks {
+		if !candidateBlockHashes[b.Hash] {
+			for _, tx := range b.Transactions {
+				if tx.Sender != "" { // Skip genesis/coinbase
+					key := tx.Signature
+					if key == "" {
+						key = fmt.Sprintf("%s:%s:%d", tx.Sender, tx.Recipient, tx.Amount)
+					}
+					if !candidateTxs[key] {
+						orphanedTxs = append(orphanedTxs, tx)
+					}
+				}
+			}
+		}
+	}
+
+	bc.Blocks = candidateChain
+	return true, orphanedTxs, nil
 }

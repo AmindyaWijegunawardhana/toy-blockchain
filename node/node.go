@@ -2,265 +2,299 @@ package node
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"sync"
+	"time"
+
 	"toy-blockchain/block"
 	"toy-blockchain/chain"
 	"toy-blockchain/ledger"
 )
 
+// Node represents a networked blockchain node process.
 type Node struct {
-	mu          sync.RWMutex
-	Address     string
-	Peers       map[string]bool
-	Chain       *chain.Blockchain
+	Addr       string
+	Peers      []string
+	Blockchain *chain.Blockchain
+
+	PendingPool []*ledger.Transaction
 	seenTxs     map[string]bool
-	seenBlocks  map[string]bool
-	Server      *http.Server
+	mu          sync.RWMutex
+	client      *http.Client
+	server      *http.Server
 }
 
-func NewNode(address string, initialPeers []string, difficulty int) *Node {
-	peerMap := make(map[string]bool)
-	for _, p := range initialPeers {
-		if p != "" && p != address {
-			peerMap[p] = true
-		}
-	}
+// NewNode initializes a new Node process with its listen address, peer list, and chain instance.
+func NewNode(addr string, peers []string, bc *chain.Blockchain) *Node {
+	peersCopy := make([]string, len(peers))
+	copy(peersCopy, peers)
 
 	return &Node{
-		Address:    address,
-		Peers:      peerMap,
-		Chain:      chain.NewBlockchain(difficulty),
-		seenTxs:    make(map[string]bool),
-		seenBlocks: make(map[string]bool),
+		Addr:        addr,
+		Peers:       peersCopy,
+		Blockchain:  bc,
+		PendingPool: make([]*ledger.Transaction, 0),
+		seenTxs:     make(map[string]bool),
+		client:      &http.Client{Timeout: 2 * time.Second},
 	}
 }
 
+// Start launches the HTTP server for this node.
 func (n *Node) Start() error {
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("GET /chain", n.handleGetChain)
-	mux.HandleFunc("GET /height", n.handleGetHeight)
-	mux.HandleFunc("GET /peers", n.handleGetPeers)
-	mux.HandleFunc("POST /peers", n.handleAddPeer)
-	mux.HandleFunc("POST /tx", n.handleReceiveTx)
-	mux.HandleFunc("POST /block", n.handleReceiveBlock)
-	mux.HandleFunc("POST /mine", n.handleMine)
-	mux.HandleFunc("GET /balances", n.handleGetBalances)
-	mux.HandleFunc("POST /sync", n.handleSync)
+	mux.HandleFunc("/chain", n.handleGetChain)
+	mux.HandleFunc("/status", n.handleGetStatus)
+	mux.HandleFunc("/transaction", n.handleTransaction)
+	mux.HandleFunc("/block", n.handleBlock)
+	mux.HandleFunc("/blocks", n.handleGetBlocks)
 
-	n.Server = &http.Server{
-		Addr:    n.Address,
+	n.server = &http.Server{
+		Addr:    n.Addr,
 		Handler: mux,
 	}
 
-	log.Printf("[%s] Node HTTP Server started.", n.Address)
-	return n.Server.ListenAndServe()
+	log.Printf("[%s] Node HTTP Server starting...", n.Addr)
+	return n.server.ListenAndServe()
 }
 
-func (n *Node) handleReceiveTx(w http.ResponseWriter, r *http.Request) {
-	var tx ledger.Transaction
-	if err := json.NewDecoder(r.Body).Decode(&tx); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+// Stop gracefully shuts down the node HTTP server.
+func (n *Node) Stop() error {
+	if n.server != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		return n.server.Shutdown(ctx)
+	}
+	return nil
+}
+
+func (n *Node) handleGetChain(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	n.mu.Lock()
-	txID := tx.Signature
-	if txID == "" {
-		txID = fmt.Sprintf("%s-%s-%d", tx.Sender, tx.Recipient, tx.Amount)
+	blocks := n.Blockchain.GetBlocks()
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"blocks":     blocks,
+		"difficulty": n.Blockchain.Difficulty,
+	})
+}
+
+func (n *Node) handleGetStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
 	}
 
+	n.mu.RLock()
+	peersCopy := make([]string, len(n.Peers))
+	copy(peersCopy, n.Peers)
+	pendingCount := len(n.PendingPool)
+	n.mu.RUnlock()
+
+	status := map[string]interface{}{
+		"address":     n.Addr,
+		"peers":       peersCopy,
+		"block_count": n.Blockchain.BlockCount(),
+		"pending_txs": pendingCount,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(status)
+}
+
+func (n *Node) handleGetBlocks(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	fromStr := r.URL.Query().Get("from")
+	fromIdx := 0
+	if fromStr != "" {
+		parsed, err := strconv.Atoi(fromStr)
+		if err == nil && parsed >= 0 {
+			fromIdx = parsed
+		}
+	}
+
+	allBlocks := n.Blockchain.GetBlocks()
+	if fromIdx >= len(allBlocks) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode([]*block.Block{})
+		return
+	}
+
+	requestedBlocks := allBlocks[fromIdx:]
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(requestedBlocks)
+}
+
+func (n *Node) handleTransaction(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var tx ledger.Transaction
+	if err := json.NewDecoder(r.Body).Decode(&tx); err != nil {
+		http.Error(w, "Invalid transaction payload", http.StatusBadRequest)
+		return
+	}
+
+	if err := ledger.VerifyTransaction(&tx); err != nil {
+		http.Error(w, fmt.Sprintf("Transaction verification failed: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	txID := tx.Signature
+
+	n.mu.Lock()
 	if n.seenTxs[txID] {
 		n.mu.Unlock()
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("Transaction already seen"))
+		json.NewEncoder(w).Encode(map[string]string{"status": "ignored", "reason": "duplicate transaction"})
 		return
 	}
+
 	n.seenTxs[txID] = true
+	n.PendingPool = append(n.PendingPool, &tx)
 	n.mu.Unlock()
 
-	if err := n.Chain.AddTransaction(tx); err != nil {
-		http.Error(w, fmt.Sprintf("Invalid TX: %v", err), http.StatusBadRequest)
-		return
-	}
-
-	log.Printf("[%s] Accepted new TX: %s -> %s (%d)", n.Address, tx.Sender[:8], tx.Recipient[:8], tx.Amount)
-	go n.broadcast("/tx", tx)
+	go n.gossipTransaction(&tx)
 
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(map[string]string{"status": "accepted"})
 }
 
-func (n *Node) handleReceiveBlock(w http.ResponseWriter, r *http.Request) {
+func (n *Node) handleBlock(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
 	var newBlock block.Block
 	if err := json.NewDecoder(r.Body).Decode(&newBlock); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		http.Error(w, "Invalid block payload", http.StatusBadRequest)
 		return
 	}
 
-	n.mu.Lock()
-	if n.seenBlocks[newBlock.Hash] {
-		n.mu.Unlock()
-		w.WriteHeader(http.StatusOK)
-		return
-	}
-	n.seenBlocks[newBlock.Hash] = true
-	n.mu.Unlock()
+	tip := n.Blockchain.LatestBlock()
 
-	latestBlock := n.Chain.Blocks[len(n.Chain.Blocks)-1]
-	if newBlock.PrevHash == latestBlock.Hash && newBlock.Index == latestBlock.Index+1 {
-		n.Chain.Blocks = append(n.Chain.Blocks, &newBlock)
-		valid, idx, err := n.Chain.ValidateChain()
-		if !valid {
-			n.Chain.Blocks = n.Chain.Blocks[:len(n.Chain.Blocks)-1]
-			http.Error(w, fmt.Sprintf("Invalid block received: %v at %d", err, idx), http.StatusBadRequest)
-			return
-		}
-
-		log.Printf("[%s] Accepted & Appended Block #%d [%s]", n.Address, newBlock.Index, newBlock.Hash[:8])
-		go n.broadcast("/block", newBlock)
+	if newBlock.Index != tip.Index+1 || newBlock.PrevHash != tip.Hash {
 		w.WriteHeader(http.StatusAccepted)
+		json.NewEncoder(w).Encode(map[string]string{"status": "deferred_for_sync"})
 		return
 	}
 
-	if newBlock.Index > latestBlock.Index {
-		go n.SyncWithPeers()
-	}
-
-	w.WriteHeader(http.StatusOK)
-}
-
-func (n *Node) handleMine(w http.ResponseWriter, r *http.Request) {
-	minedBlock, err := n.Chain.MinePendingBlock()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
+	n.Blockchain.AddBlock(&newBlock)
 
 	n.mu.Lock()
-	n.seenBlocks[minedBlock.Hash] = true
+	n.removePendingTxs(newBlock.Transactions)
 	n.mu.Unlock()
 
-	log.Printf("[%s] Mined Block #%d [%s]", n.Address, minedBlock.Index, minedBlock.Hash[:8])
-	go n.broadcast("/block", minedBlock)
-
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(minedBlock)
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(map[string]string{"status": "appended"})
 }
 
-func (n *Node) handleGetChain(w http.ResponseWriter, r *http.Request) {
-	json.NewEncoder(w).Encode(n.Chain.Blocks)
-}
-
-func (n *Node) handleGetHeight(w http.ResponseWriter, r *http.Request) {
-	json.NewEncoder(w).Encode(map[string]int{"height": len(n.Chain.Blocks)})
-}
-
-func (n *Node) handleGetPeers(w http.ResponseWriter, r *http.Request) {
+// SyncWithPeers queries peers for their chain state and handles fork resolution / reorganisation.
+func (n *Node) SyncWithPeers() error {
 	n.mu.RLock()
-	defer n.mu.RUnlock()
-
-	peers := make([]string, 0, len(n.Peers))
-	for p := range n.Peers {
-		peers = append(peers, p)
-	}
-	json.NewEncoder(w).Encode(peers)
-}
-
-func (n *Node) handleAddPeer(w http.ResponseWriter, r *http.Request) {
-	var body map[string]string
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	newPeer := body["peer"]
-	if newPeer != "" && newPeer != n.Address {
-		n.mu.Lock()
-		n.Peers[newPeer] = true
-		n.mu.Unlock()
-	}
-
-	w.WriteHeader(http.StatusOK)
-}
-
-func (n *Node) handleGetBalances(w http.ResponseWriter, r *http.Request) {
-	json.NewEncoder(w).Encode(n.Chain.GetBalances())
-}
-
-func (n *Node) handleSync(w http.ResponseWriter, r *http.Request) {
-	go n.SyncWithPeers()
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("Sync triggered"))
-}
-
-func (n *Node) SyncWithPeers() {
-	n.mu.RLock()
-	peers := make([]string, 0, len(n.Peers))
-	for p := range n.Peers {
-		peers = append(peers, p)
-	}
+	peersCopy := make([]string, len(n.Peers))
+	copy(peersCopy, n.Peers)
 	n.mu.RUnlock()
 
-	for _, peer := range peers {
-		resp, err := http.Get(fmt.Sprintf("http://%s/chain", peer))
+	for _, peer := range peersCopy {
+		chainURL := fmt.Sprintf("http://%s/chain", peer)
+		resp, err := n.client.Get(chainURL)
 		if err != nil {
 			continue
 		}
 
-		var remoteBlocks []*block.Block
-		if err := json.NewDecoder(resp.Body).Decode(&remoteBlocks); err != nil {
-			resp.Body.Close()
+		var payload struct {
+			Blocks     []*block.Block `json:"blocks"`
+			Difficulty int            `json:"difficulty"`
+		}
+		err = json.NewDecoder(resp.Body).Decode(&payload)
+		resp.Body.Close()
+		if err != nil {
 			continue
 		}
-		resp.Body.Close()
 
-		if len(remoteBlocks) > len(n.Chain.Blocks) {
-			log.Printf("[%s] Found longer chain on peer %s (len %d vs local %d). Attempting reorg...",
-				n.Address, peer, len(remoteBlocks), len(n.Chain.Blocks))
-
-			replaced, err := n.Chain.ResolveFork(remoteBlocks)
-			if replaced {
-				log.Printf("[%s] Reorg successful! Adopted longer chain of length %d", n.Address, len(remoteBlocks))
-				break
-			} else {
-				log.Printf("[%s] Fork resolution rejected chain: %v", n.Address, err)
+		if len(payload.Blocks) > n.Blockchain.BlockCount() {
+			reorged, orphanedTxs, err := n.Blockchain.ResolveFork(payload.Blocks)
+			if err == nil && reorged {
+				n.mu.Lock()
+				for i := range orphanedTxs {
+					tx := orphanedTxs[i]
+					n.PendingPool = append(n.PendingPool, &tx)
+				}
+				n.mu.Unlock()
 			}
 		}
 	}
+	return nil
 }
 
-func (n *Node) broadcast(endpoint string, payload interface{}) {
-	n.mu.RLock()
-	peers := make([]string, 0, len(n.Peers))
-	for p := range n.Peers {
-		peers = append(peers, p)
-	}
-	n.mu.RUnlock()
-
-	data, err := json.Marshal(payload)
+// BroadcastBlock sends a newly mined block to all connected peers.
+func (n *Node) BroadcastBlock(b block.Block) {
+	data, err := json.Marshal(b)
 	if err != nil {
 		return
 	}
 
-	for _, peer := range peers {
-		url := fmt.Sprintf("http://%s%s", peer, endpoint)
-		req, err := http.NewRequest("POST", url, bytes.NewBuffer(data))
-		if err != nil {
-			continue
-		}
-		req.Header.Set("Content-Type", "application/json")
+	n.mu.RLock()
+	peersCopy := make([]string, len(n.Peers))
+	copy(peersCopy, n.Peers)
+	n.mu.RUnlock()
 
-		client := &http.Client{}
-		resp, err := client.Do(req)
+	for _, peer := range peersCopy {
+		peerURL := fmt.Sprintf("http://%s/block", peer)
+		resp, err := n.client.Post(peerURL, "application/json", bytes.NewBuffer(data))
 		if err == nil {
-			io.Copy(io.Discard, resp.Body)
 			resp.Body.Close()
 		}
 	}
+}
+
+func (n *Node) gossipTransaction(tx *ledger.Transaction) {
+	data, err := json.Marshal(tx)
+	if err != nil {
+		return
+	}
+
+	n.mu.RLock()
+	peersCopy := make([]string, len(n.Peers))
+	copy(peersCopy, n.Peers)
+	n.mu.RUnlock()
+
+	for _, peer := range peersCopy {
+		peerURL := fmt.Sprintf("http://%s/transaction", peer)
+		resp, err := n.client.Post(peerURL, "application/json", bytes.NewBuffer(data))
+		if err == nil {
+			resp.Body.Close()
+		}
+	}
+}
+
+func (n *Node) removePendingTxs(minedTxs []ledger.Transaction) {
+	minedMap := make(map[string]bool)
+	for _, tx := range minedTxs {
+		minedMap[tx.Signature] = true
+	}
+
+	newPool := make([]*ledger.Transaction, 0)
+	for _, tx := range n.PendingPool {
+		if !minedMap[tx.Signature] {
+			newPool = append(newPool, tx)
+		}
+	}
+	n.PendingPool = newPool
 }

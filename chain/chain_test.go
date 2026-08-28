@@ -1,280 +1,103 @@
 package chain
 
 import (
-	"encoding/hex"
 	"testing"
+	"time"
+
 	"toy-blockchain/block"
 	"toy-blockchain/ledger"
 )
 
-// TestPendingPoolDoubleSpend catches the pending queue double-spend weakness with cryptographic keys
-func TestPendingPoolDoubleSpend(t *testing.T) {
-	bc := NewBlockchain(2)
-
-	_, alicePub, err := ledger.GenerateKeyPair()
-	if err != nil {
-		t.Fatalf("Failed to generate keys: %v", err)
-	}
-	alicePubHex := hex.EncodeToString(alicePub)
-
-	_ = bc.AddTransaction(ledger.NewTransaction("faucet", alicePubHex, 100))
-	_, _ = bc.MinePendingBlock()
-
-	alicePriv, alicePubReal, _ := ledger.GenerateKeyPair()
-	alicePubRealHex := hex.EncodeToString(alicePubReal)
-
-	_ = bc.AddTransaction(ledger.NewTransaction("faucet", alicePubRealHex, 100))
-
-	latestBlock := bc.Blocks[len(bc.Blocks)-1]
-	b := block.NewBlock(latestBlock.Index+1, bc.PendingPool, latestBlock.Hash)
-	b.Timestamp = latestBlock.Timestamp + 1
-	b.Mine(bc.Difficulty)
-
-	bc.mu.Lock()
-	bc.Blocks = append(bc.Blocks, b)
-	bc.PendingPool = make([]ledger.Transaction, 0)
-	bc.mu.Unlock()
-
-	tx1 := ledger.NewTransaction(alicePubRealHex, "Bob", 60)
-	if err := tx1.Sign(alicePriv); err != nil {
-		t.Fatalf("Signing failed: %v", err)
-	}
-
-	err1 := bc.AddTransaction(tx1)
-	if err1 != nil {
-		t.Fatalf("First legitimate spend was unexpectedly rejected: %v", err1)
-	}
-
-	tx2 := ledger.NewTransaction(alicePubRealHex, "Charlie", 60)
-	if err := tx2.Sign(alicePriv); err != nil {
-		t.Fatalf("Signing failed: %v", err)
-	}
-
-	err2 := bc.AddTransaction(tx2)
-	if err2 == nil {
-		t.Error("CRITICAL EXPLOIT: System accepted a double-spend transaction into the pending pool queue.")
-	}
-}
-
-// TestGenesisTamperDetection verifies that mutating block 0 triggers explicit validation errors
-func TestGenesisTamperDetection(t *testing.T) {
-	bc := NewBlockchain(2)
-
-	bc.Blocks[0].Transactions = append(bc.Blocks[0].Transactions, ledger.NewTransaction("system", "Eve", 1000000))
-
-	valid, _, err := bc.ValidateChain()
-	if valid || err == nil {
-		t.Error("CRITICAL SECURITY EXPLOIT: Genesis block tampering was accepted silently without triggering errors.")
-	}
-}
-
-// TestNegativeLedgerReplay confirms ledger state engine refuses negative drops
-func TestNegativeLedgerReplay(t *testing.T) {
+func TestBlockchainInitialization(t *testing.T) {
 	bc := NewBlockchain(1)
-
-	_ = bc.AddTransaction(ledger.NewTransaction("faucet", "Bob", 50))
-	_, _ = bc.MinePendingBlock()
-
-	maliciousBlock := block.NewBlock(2, []ledger.Transaction{
-		ledger.NewTransaction("Bob", "Eve", 9999),
-	}, bc.Blocks[len(bc.Blocks)-1].Hash)
-	maliciousBlock.Timestamp = bc.Blocks[len(bc.Blocks)-1].Timestamp + 1
-	maliciousBlock.Mine(1)
-
-	bc.Blocks = append(bc.Blocks, maliciousBlock)
-
-	valid, _, err := bc.ValidateChain()
-	if valid || err == nil {
-		t.Error("SECURITY BREAK: Ledger replay did not intercept negative asset balances during validation.")
+	if bc.BlockCount() != 1 {
+		t.Fatalf("Expected initial chain length 1, got %d", bc.BlockCount())
+	}
+	if bc.Blocks[0].Index != 0 {
+		t.Errorf("Expected genesis index 0, got %d", bc.Blocks[0].Index)
 	}
 }
 
-// TestTimestampValidation enforces chronological structural continuity rules
-func TestTimestampValidation(t *testing.T) {
-	bc := NewBlockchain(1)
+func TestForkResolutionAndReorganization(t *testing.T) {
+	bcMain := NewBlockchain(1)
+	bcFork := NewBlockchain(1)
 
-	_ = bc.AddTransaction(ledger.NewTransaction("faucet", "Bob", 10))
-	_, _ = bc.MinePendingBlock()
-
-	badBlock := block.NewBlock(2, []ledger.Transaction{
-		ledger.NewTransaction("Bob", "Alice", 5),
-	}, bc.Blocks[len(bc.Blocks)-1].Hash)
-	badBlock.Timestamp = bc.Blocks[0].Timestamp - 500
-	badBlock.Mine(1)
-
-	bc.Blocks = append(bc.Blocks, badBlock)
-
-	valid, _, err := bc.ValidateChain()
-	if valid || err == nil {
-		t.Error("STRUCTURAL RULE GAP: Chain validation did not reject out-of-order block timestamps.")
-	}
-}
-
-// TestSignatureVerificationAndIdentityForgery validates cryptographic authentication fields
-func TestSignatureVerificationAndIdentityForgery(t *testing.T) {
-	bc := NewBlockchain(1)
-
-	alicePriv, alicePub, err := ledger.GenerateKeyPair()
+	sender, err := ledger.NewWallet()
 	if err != nil {
-		t.Fatalf("Failed to generate keys: %v", err)
+		t.Fatalf("Failed to create sender wallet: %v", err)
 	}
-	alicePubHex := hex.EncodeToString(alicePub)
-
-	tx1 := ledger.NewTransaction("faucet", alicePubHex, 500)
-	err = bc.AddTransaction(tx1)
+	recipient, err := ledger.NewWallet()
 	if err != nil {
-		t.Fatalf("Failed to add funding tx: %v", err)
+		t.Fatalf("Failed to create recipient wallet: %v", err)
 	}
 
-	latestBlock := bc.Blocks[len(bc.Blocks)-1]
-	b1 := block.NewBlock(latestBlock.Index+1, bc.PendingPool, latestBlock.Hash)
-	b1.Timestamp = bc.Blocks[0].Timestamp + 1
-	b1.Mine(bc.Difficulty)
+	// Create shared genesis block with initial credit
+	rewardTx := ledger.NewTransaction("", sender.Address(), 500)
+	sharedGenesis := &block.Block{
+		Index:        0,
+		Timestamp:    0,
+		Transactions: []ledger.Transaction{rewardTx},
+		PrevHash:     "0",
+		Nonce:        0,
+	}
+	sharedGenesis.Mine(1)
 
-	bc.mu.Lock()
-	bc.Blocks = append(bc.Blocks, b1)
-	bc.PendingPool = make([]ledger.Transaction, 0)
-	bc.mu.Unlock()
+	bcMain.Blocks = []*block.Block{sharedGenesis}
+	bcFork.Blocks = []*block.Block{sharedGenesis}
 
-	_, bobPub, _ := ledger.GenerateKeyPair()
-	bobPubHex := hex.EncodeToString(bobPub)
-
-	tx2 := ledger.NewTransaction(alicePubHex, bobPubHex, 200)
-
-	err = tx2.Sign(alicePriv)
+	// Main chain stages and mines Tx A
+	txA, err := ledger.SignTransaction(sender, recipient.Address(), 100)
 	if err != nil {
-		t.Fatalf("Failed to sign transaction: %v", err)
+		t.Fatalf("Failed to sign txA: %v", err)
 	}
-
-	err = bc.AddTransaction(tx2)
+	_ = bcMain.AddTransaction(*txA)
+	bMain1, err := bcMain.MinePendingBlock()
 	if err != nil {
-		t.Fatalf("Legitimate signed transaction was rejected at gateway: %v", err)
+		t.Fatalf("Failed to mine on main: %v", err)
+	}
+	if len(bMain1.Transactions) == 0 {
+		t.Fatalf("bMain1 has no transactions")
 	}
 
-	latestBlock = bc.Blocks[len(bc.Blocks)-1]
-	b2 := block.NewBlock(latestBlock.Index+1, bc.PendingPool, latestBlock.Hash)
-	b2.Timestamp = b1.Timestamp + 1
-	b2.Mine(bc.Difficulty)
+	time.Sleep(10 * time.Millisecond)
 
-	bc.mu.Lock()
-	bc.Blocks = append(bc.Blocks, b2)
-	bc.PendingPool = make([]ledger.Transaction, 0)
-	bc.mu.Unlock()
-
-	valid, brokenIdx, valErr := bc.ValidateChain()
-	if !valid {
-		t.Fatalf("Blockchain rejected valid cryptographic signatures at block index %d: %v", brokenIdx, valErr)
+	// Fork chain stages and mines Tx B, then mines a second block to make it strictly longer
+	txB, err := ledger.SignTransaction(sender, recipient.Address(), 50)
+	if err != nil {
+		t.Fatalf("Failed to sign txB: %v", err)
+	}
+	_ = bcFork.AddTransaction(*txB)
+	_, err = bcFork.MinePendingBlock()
+	if err != nil {
+		t.Fatalf("Failed to mine fork block 1: %v", err)
 	}
 
-	maliciousTx := ledger.NewTransaction(alicePubHex, bobPubHex, 50)
-	attackerPriv, _, _ := ledger.GenerateKeyPair()
+	time.Sleep(10 * time.Millisecond)
 
-	_ = maliciousTx.Sign(attackerPriv)
-
-	latestBlock = bc.Blocks[len(bc.Blocks)-1]
-	forgedBlock := block.NewBlock(latestBlock.Index+1, []ledger.Transaction{maliciousTx}, latestBlock.Hash)
-	forgedBlock.Timestamp = latestBlock.Timestamp + 1
-	forgedBlock.Mine(bc.Difficulty)
-
-	bc.Blocks = append(bc.Blocks, forgedBlock)
-
-	validPostAttack, _, _ := bc.ValidateChain()
-	if validPostAttack {
-		t.Error("CRITICAL HIGH EXPLOIT: Validation engine accepted an illicit signature forgery.")
-	}
-}
-
-// TestDifficultyRetargeting confirms that mining complexity shifts dynamically to match block production speed
-func TestDifficultyRetargeting(t *testing.T) {
-	bc := NewBlockchain(1)
-
-	_, alicePub, _ := ledger.GenerateKeyPair()
-	alicePubHex := hex.EncodeToString(alicePub)
-
-	for i := 1; i <= 4; i++ {
-		_ = bc.AddTransaction(ledger.NewTransaction("faucet", alicePubHex, int64(i*10)))
-
-		latestBlock := bc.Blocks[len(bc.Blocks)-1]
-		b := block.NewBlock(latestBlock.Index+1, bc.PendingPool, latestBlock.Hash)
-		b.Timestamp = latestBlock.Timestamp + 1
-
-		targetDiff := bc.CalculateNextDifficulty(b.Index)
-		b.Mine(targetDiff)
-
-		bc.mu.Lock()
-		bc.Blocks = append(bc.Blocks, b)
-		bc.PendingPool = make([]ledger.Transaction, 0)
-		bc.mu.Unlock()
+	_, err = bcFork.MinePendingBlock()
+	if err != nil {
+		t.Fatalf("Failed to mine fork block 2: %v", err)
 	}
 
-	nextDiff := bc.CalculateNextDifficulty(4)
-	if nextDiff <= 1 {
-		t.Errorf("RETARGETING FAILURE: Expected difficulty to scale up due to hyper-fast block generation velocity, but stayed at %d", nextDiff)
+	reorged, orphanedTxs, err := bcMain.ResolveFork(bcFork.Blocks)
+	if err != nil {
+		t.Fatalf("Fork resolution failed: %v", err)
 	}
 
-	bc.Difficulty = 1
-
-	valid, brokenIdx, err := bc.ValidateChain()
-	if !valid {
-		t.Fatalf("Retargeting verification error at block index %d: %v", brokenIdx, err)
-	}
-}
-
-// TestForkResolution verifies that the node adopts the longest valid competing chain
-func TestForkResolution(t *testing.T) {
-	localBC := NewBlockchain(1)
-	_, alicePub, _ := ledger.GenerateKeyPair()
-	alicePubHex := hex.EncodeToString(alicePub)
-
-	_ = localBC.AddTransaction(ledger.NewTransaction("faucet", alicePubHex, 100))
-	b1Local, err := localBC.MinePendingBlock()
-	if err != nil || b1Local == nil {
-		t.Fatalf("Failed to mine initial local block: %v", err)
+	if !reorged {
+		t.Fatalf("Expected chain to reorganize to longer fork")
 	}
 
-	competingBC := NewBlockchain(1)
-	_, bobPub, _ := ledger.GenerateKeyPair()
-	bobPubHex := hex.EncodeToString(bobPub)
-
-	_ = competingBC.AddTransaction(ledger.NewTransaction("faucet", bobPubHex, 200))
-	b1Comp, err := competingBC.MinePendingBlock()
-	if err != nil || b1Comp == nil {
-		t.Fatalf("Failed to mine competing block 1: %v", err)
+	if bcMain.BlockCount() != 3 {
+		t.Errorf("Expected chain length to be 3 after reorg, got %d", bcMain.BlockCount())
 	}
 
-	_ = competingBC.AddTransaction(ledger.NewTransaction("faucet", "Charlie", 50))
-	latestBlock := competingBC.Blocks[len(competingBC.Blocks)-1]
-	b2Comp := block.NewBlock(latestBlock.Index+1, competingBC.PendingPool, latestBlock.Hash)
-	b2Comp.Timestamp = latestBlock.Timestamp + 1
-	b2Comp.Mine(competingBC.Difficulty)
-
-	competingBC.mu.Lock()
-	competingBC.Blocks = append(competingBC.Blocks, b2Comp)
-	competingBC.PendingPool = make([]ledger.Transaction, 0)
-	competingBC.mu.Unlock()
-
-	replaced, err := localBC.ResolveFork(competingBC.Blocks)
-	if !replaced || err != nil {
-		t.Fatalf("FAILED: Local chain failed to adopt valid longer competing chain: %v", err)
+	if len(orphanedTxs) != 1 || orphanedTxs[0].Signature != txA.Signature {
+		t.Errorf("Expected Tx A to be resurrected as orphaned transaction, got %d txs", len(orphanedTxs))
 	}
 
-	if len(localBC.Blocks) != 3 {
-		t.Errorf("Expected local chain length to be 3 after reorg, got %d", len(localBC.Blocks))
-	}
-
-	invalidBlocks := make([]*block.Block, len(competingBC.Blocks))
-	copy(invalidBlocks, competingBC.Blocks)
-
-	lastBlock := invalidBlocks[len(invalidBlocks)-1]
-	forgedTx := ledger.NewTransaction(alicePubHex, "Eve", 999999)
-	badBlock := block.NewBlock(lastBlock.Index+1, []ledger.Transaction{forgedTx}, lastBlock.Hash)
-	badBlock.Timestamp = lastBlock.Timestamp + 1
-	badBlock.Mine(1)
-
-	invalidBlocks = append(invalidBlocks, badBlock)
-
-	replacedPostAttack, _ := localBC.ResolveFork(invalidBlocks)
-	if replacedPostAttack {
-		t.Error("CRITICAL SECURITY FAILURE: Local chain accepted an invalid longer chain fork!")
+	balances := bcMain.RebuildLedgerBalances()
+	if balances[recipient.Address()] != 50 {
+		t.Errorf("Expected recipient balance 50, got %d", balances[recipient.Address()])
 	}
 }

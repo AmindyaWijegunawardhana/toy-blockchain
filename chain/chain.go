@@ -13,7 +13,7 @@ import (
 	"toy-blockchain/ledger"
 )
 
-// Blockchain manages the sequential chain of blocks and ledger state.
+// Blockchain manages the sequential chain of blocks and ledger state with full thread safety.
 type Blockchain struct {
 	Blocks              []*block.Block
 	PendingTransactions []ledger.Transaction
@@ -49,7 +49,7 @@ func (bc *Blockchain) LatestBlock() *block.Block {
 	return &copied
 }
 
-// GetBlocks returns a thread-safe shallow copy slice of the current block pointers.
+// GetBlocks returns a thread-safe copy slice of the current block pointers.
 func (bc *Blockchain) GetBlocks() []*block.Block {
 	bc.mu.RLock()
 	defer bc.mu.RUnlock()
@@ -80,6 +80,16 @@ func (bc *Blockchain) AddTransaction(tx ledger.Transaction) error {
 
 	bc.PendingTransactions = append(bc.PendingTransactions, tx)
 	return nil
+}
+
+// GetPendingTransactions returns a thread-safe copy of the staged transactions.
+func (bc *Blockchain) GetPendingTransactions() []ledger.Transaction {
+	bc.mu.RLock()
+	defer bc.mu.RUnlock()
+
+	txsCopy := make([]ledger.Transaction, len(bc.PendingTransactions))
+	copy(txsCopy, bc.PendingTransactions)
+	return txsCopy
 }
 
 // MinePendingBlock packages pending transactions into a new block and mines it.
@@ -220,13 +230,11 @@ func (bc *Blockchain) ResolveFork(candidateChain []*block.Block) (bool, []ledger
 		return false, nil, fmt.Errorf("candidate chain invalid: %w", err)
 	}
 
-	// Index hashes of all candidate blocks
 	candidateBlockHashes := make(map[string]bool)
 	for _, b := range candidateChain {
 		candidateBlockHashes[b.Hash] = true
 	}
 
-	// Index all transactions in candidate chain by signature or payload
 	candidateTxs := make(map[string]bool)
 	for _, b := range candidateChain {
 		for _, tx := range b.Transactions {
@@ -238,12 +246,11 @@ func (bc *Blockchain) ResolveFork(candidateChain []*block.Block) (bool, []ledger
 		}
 	}
 
-	// Find all orphaned transactions from local blocks that are NOT in candidateChain
 	orphanedTxs := make([]ledger.Transaction, 0)
 	for _, b := range bc.Blocks {
 		if !candidateBlockHashes[b.Hash] {
 			for _, tx := range b.Transactions {
-				if tx.Sender != "" { // Skip genesis/coinbase
+				if tx.Sender != "" {
 					key := tx.Signature
 					if key == "" {
 						key = fmt.Sprintf("%s:%s:%d", tx.Sender, tx.Recipient, tx.Amount)

@@ -16,7 +16,7 @@ import (
 	"toy-blockchain/ledger"
 )
 
-// Node represents a networked blockchain node process.
+// Node represents a networked blockchain node process with full concurrent state protection.
 type Node struct {
 	Addr       string
 	Peers      []string
@@ -42,6 +42,39 @@ func NewNode(addr string, peers []string, bc *chain.Blockchain) *Node {
 		seenTxs:     make(map[string]bool),
 		client:      &http.Client{Timeout: 2 * time.Second},
 	}
+}
+
+// AddPeer safely registers a new peer in the active peer set.
+func (n *Node) AddPeer(peer string) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	for _, p := range n.Peers {
+		if p == peer {
+			return
+		}
+	}
+	n.Peers = append(n.Peers, peer)
+}
+
+// GetPeers safely returns a copy of the peer set.
+func (n *Node) GetPeers() []string {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+
+	peersCopy := make([]string, len(n.Peers))
+	copy(peersCopy, n.Peers)
+	return peersCopy
+}
+
+// GetPendingPool returns a thread-safe snapshot of the pending transactions in the mempool.
+func (n *Node) GetPendingPool() []*ledger.Transaction {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+
+	poolCopy := make([]*ledger.Transaction, len(n.PendingPool))
+	copy(poolCopy, n.PendingPool)
+	return poolCopy
 }
 
 // Start launches the HTTP server for this node.
@@ -155,6 +188,9 @@ func (n *Node) handleTransaction(w http.ResponseWriter, r *http.Request) {
 	}
 
 	txID := tx.Signature
+	if txID == "" {
+		txID = tx.Hash()
+	}
 
 	n.mu.Lock()
 	if n.seenTxs[txID] {
@@ -206,10 +242,7 @@ func (n *Node) handleBlock(w http.ResponseWriter, r *http.Request) {
 
 // SyncWithPeers queries peers for their chain state and handles fork resolution / reorganisation.
 func (n *Node) SyncWithPeers() error {
-	n.mu.RLock()
-	peersCopy := make([]string, len(n.Peers))
-	copy(peersCopy, n.Peers)
-	n.mu.RUnlock()
+	peersCopy := n.GetPeers()
 
 	for _, peer := range peersCopy {
 		chainURL := fmt.Sprintf("http://%s/chain", peer)
@@ -250,10 +283,7 @@ func (n *Node) BroadcastBlock(b block.Block) {
 		return
 	}
 
-	n.mu.RLock()
-	peersCopy := make([]string, len(n.Peers))
-	copy(peersCopy, n.Peers)
-	n.mu.RUnlock()
+	peersCopy := n.GetPeers()
 
 	for _, peer := range peersCopy {
 		peerURL := fmt.Sprintf("http://%s/block", peer)
@@ -270,10 +300,7 @@ func (n *Node) gossipTransaction(tx *ledger.Transaction) {
 		return
 	}
 
-	n.mu.RLock()
-	peersCopy := make([]string, len(n.Peers))
-	copy(peersCopy, n.Peers)
-	n.mu.RUnlock()
+	peersCopy := n.GetPeers()
 
 	for _, peer := range peersCopy {
 		peerURL := fmt.Sprintf("http://%s/transaction", peer)
@@ -287,12 +314,20 @@ func (n *Node) gossipTransaction(tx *ledger.Transaction) {
 func (n *Node) removePendingTxs(minedTxs []ledger.Transaction) {
 	minedMap := make(map[string]bool)
 	for _, tx := range minedTxs {
-		minedMap[tx.Signature] = true
+		id := tx.Signature
+		if id == "" {
+			id = tx.Hash()
+		}
+		minedMap[id] = true
 	}
 
 	newPool := make([]*ledger.Transaction, 0)
 	for _, tx := range n.PendingPool {
-		if !minedMap[tx.Signature] {
+		id := tx.Signature
+		if id == "" {
+			id = tx.Hash()
+		}
+		if !minedMap[id] {
 			newPool = append(newPool, tx)
 		}
 	}

@@ -55,7 +55,8 @@ func TestConcurrentGossipAndMining(t *testing.T) {
 
 	var wg sync.WaitGroup
 
-	for i := 0; i < 5; i++ {
+	// Concurrently send transactions
+	for i := 0; i < 10; i++ {
 		wg.Add(1)
 		go func(val int64) {
 			defer wg.Done()
@@ -68,7 +69,8 @@ func TestConcurrentGossipAndMining(t *testing.T) {
 		}(int64(i))
 	}
 
-	for i := 0; i < 5; i++ {
+	// Concurrently read status & peer queries
+	for i := 0; i < 10; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -77,6 +79,16 @@ func TestConcurrentGossipAndMining(t *testing.T) {
 				resp.Body.Close()
 			}
 		}()
+	}
+
+	// Concurrently mutate peer list
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			node1.AddPeer(fmt.Sprintf("localhost:999%d", idx))
+			_ = node1.GetPeers()
+		}(i)
 	}
 
 	wg.Wait()
